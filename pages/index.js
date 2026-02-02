@@ -14,12 +14,13 @@ export default function Home() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ pages: [{ page: 1, content: text }] })
       });
-      const raw = await resp.text();
-let data;
-try { data = JSON.parse(raw); }
-catch { data = { http_status: resp.status, raw }; }
-setResult(data);
 
+      const raw = await resp.text();
+      let data;
+      try { data = JSON.parse(raw); }
+      catch { data = { http_status: resp.status, raw }; }
+
+      setResult(data);
     } catch (e) {
       setResult({ error: String(e) });
     } finally {
@@ -29,21 +30,30 @@ setResult(data);
 
   return (
     <div style={{ maxWidth: 920, margin: "40px auto", fontFamily: "sans-serif" }}>
-      <h2>课件合规自动初审（规则版）</h2>
+      <h2>课件合规自动初审</h2>
 
       <textarea
         rows={14}
         style={{ width: "100%", padding: 12, fontSize: 14 }}
-        placeholder="粘贴课件文字内容（建议脱敏）"
+        placeholder="粘贴课件文字（先用文字验证接口）"
         value={text}
         onChange={(e) => setText(e.target.value)}
       />
 
       <div style={{ marginTop: 12, display: "flex", gap: 12 }}>
-        <button onClick={onAudit} disabled={loading || !text.trim()}>
+        <button
+          type="button"              // 关键：必须是 button，避免变成 GET
+          onClick={onAudit}
+          disabled={loading || !text.trim()}
+        >
           {loading ? "审核中..." : "开始审核"}
         </button>
-        <button onClick={() => { setText(""); setResult(null); }} disabled={loading}>
+
+        <button
+          type="button"
+          onClick={() => { setText(""); setResult(null); }}
+          disabled={loading}
+        >
           清空
         </button>
       </div>
