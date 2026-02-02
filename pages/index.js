@@ -14,8 +14,12 @@ export default function Home() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ pages: [{ page: 1, content: text }] })
       });
-      const data = await resp.json();
-      setResult(data);
+      const raw = await resp.text();
+let data;
+try { data = JSON.parse(raw); }
+catch { data = { http_status: resp.status, raw }; }
+setResult(data);
+
     } catch (e) {
       setResult({ error: String(e) });
     } finally {
