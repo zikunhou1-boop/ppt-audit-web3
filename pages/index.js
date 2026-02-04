@@ -32,7 +32,6 @@ async function extractTextFromPptx(file) {
     const n = Number(p.match(/slide(\d+)\.xml/)[1]);
     pages.push({ page: n, content: texts.join("\n") });
   }
-
   return pages;
 }
 
@@ -42,6 +41,45 @@ async function extractTextFromDocx(file) {
   const { value } = await mammoth.extractRawText({ arrayBuffer });
   const text = (value || "").trim();
   return [{ page: 1, content: text }];
+}
+
+function Badge({ text, tone }) {
+  const bg =
+    tone === "high" ? "#ffe1e1" : tone === "medium" ? "#fff2cc" : "#e7f6e7";
+  const fg =
+    tone === "high" ? "#a40000" : tone === "medium" ? "#7a5a00" : "#0f5a0f";
+  return (
+    <span
+      style={{
+        display: "inline-block",
+        padding: "2px 8px",
+        borderRadius: 999,
+        background: bg,
+        color: fg,
+        fontSize: 12,
+        lineHeight: "18px"
+      }}
+    >
+      {text}
+    </span>
+  );
+}
+
+function groupIssuesByPage(issues) {
+  const map = new Map();
+  for (const it of issues || []) {
+    const p = it.page || 1;
+    if (!map.has(p)) map.set(p, []);
+    map.get(p).push(it);
+  }
+  return Array.from(map.entries()).sort((a, b) => a[0] - b[0]);
+}
+
+function formatRisk(risk) {
+  if (risk === "high") return "高";
+  if (risk === "medium") return "中";
+  if (risk === "low") return "低";
+  return String(risk || "");
 }
 
 export default function Home() {
@@ -77,7 +115,6 @@ export default function Home() {
 
       setPagesPayload(pages);
 
-      // 预览：把抽取文本放到输入框里
       const merged =
         pages.length > 1
           ? pages.map((p) => `【第${p.page}页】\n${p.content}`).join("\n\n")
@@ -125,17 +162,19 @@ export default function Home() {
     }
   }
 
+  const issues = result?.issues || [];
+  const review = result?.review || [];
+  const grouped = groupIssuesByPage(issues);
+
   return (
-    <div style={{ maxWidth: 980, margin: "40px auto", fontFamily: "sans-serif" }}>
-      <h2>课件合规自动初审（规则版）</h2>
+    <div style={{ maxWidth: 1060, margin: "40px auto", fontFamily: "sans-serif" }}>
+      <h2 style={{ marginBottom: 8 }}>课件合规自动初审（规则版）</h2>
+      <div style={{ color: "#666", marginBottom: 16, fontSize: 13 }}>
+        支持：PPTX/DOCX（抽取文字层）→ 规则审核 → 输出可读报告
+      </div>
 
       <div style={{ marginBottom: 12, display: "flex", gap: 12, alignItems: "center" }}>
-        <input
-          type="file"
-          accept=".pptx,.docx"
-          onChange={onPickFile}
-          disabled={loading}
-        />
+        <input type="file" accept=".pptx,.docx" onChange={onPickFile} disabled={loading} />
         <span style={{ color: "#666" }}>
           {fileName ? `已选择：${fileName}` : "未选择文件（支持PPTX/DOCX）"}
         </span>
@@ -147,7 +186,7 @@ export default function Home() {
       </div>
 
       <textarea
-        rows={14}
+        rows={10}
         style={{ width: "100%", padding: 12, fontSize: 14 }}
         placeholder="粘贴课件文字，或上传PPTX/DOCX自动抽取文字"
         value={text}
@@ -181,14 +220,176 @@ export default function Home() {
         >
           清空
         </button>
+
+        <button
+          type="button"
+          onClick={() => {
+            setText("本产品计划第一，预期收益高，安全稳健。");
+            setPagesPayload(null);
+            setFileName("");
+            setFileType("");
+          }}
+          disabled={loading}
+        >
+          填充测试文本
+        </button>
       </div>
 
+      {/* 报告区 */}
       <div style={{ marginTop: 24 }}>
-        <h3>审核结果</h3>
-        <pre style={{ background: "#f6f6f6", padding: 12, overflow: "auto" }}>
-          {result ? JSON.stringify(result, null, 2) : "暂无"}
-        </pre>
+        <h3 style={{ marginBottom: 10 }}>审核报告</h3>
+
+        {!result ? (
+          <div style={{ color: "#666" }}>暂无结果</div>
+        ) : result.error ? (
+          <pre style={{ background: "#f6f6f6", padding: 12, overflow: "auto" }}>
+            {JSON.stringify(result, null, 2)}
+          </pre>
+        ) : (
+          <div style={{ display: "grid", gap: 14 }}>
+            {/* 总览 */}
+            <div
+              style={{
+                border: "1px solid #eee",
+                borderRadius: 10,
+                padding: 14,
+                background: "#fff"
+              }}
+            >
+              <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+                <Badge text={result.pass ? "通过" : "不通过"} tone={result.pass ? "low" : "high"} />
+                <Badge text={`风险：${formatRisk(result.risk_level)}`} tone={result.risk_level} />
+                <span style={{ color: "#666", fontSize: 13 }}>
+                  规则版本：{result.rule_version || "-"}；命中：{issues.length} 条；复核项：{review.length} 条
+                </span>
+              </div>
+            </div>
+
+            {/* 违规清单 */}
+            <div
+              style={{
+                border: "1px solid #eee",
+                borderRadius: 10,
+                padding: 14,
+                background: "#fff"
+              }}
+            >
+              <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 10 }}>
+                <h4 style={{ margin: 0 }}>自动判定问题（issues）</h4>
+                <span style={{ color: "#666", fontSize: 13 }}>按页分组展示</span>
+              </div>
+
+              {issues.length === 0 ? (
+                <div style={{ color: "#666" }}>未命中自动判定问题</div>
+              ) : (
+                grouped.map(([pageNo, items]) => (
+                  <div key={pageNo} style={{ marginBottom: 14 }}>
+                    <div style={{ fontWeight: 700, marginBottom: 8 }}>第 {pageNo} 页</div>
+                    <div style={{ display: "grid", gap: 10 }}>
+                      {items.map((it, idx) => (
+                        <div
+                          key={`${it.rule_id}-${idx}`}
+                          style={{
+                            border: "1px solid #f0f0f0",
+                            borderRadius: 10,
+                            padding: 12,
+                            background: "#fafafa"
+                          }}
+                        >
+                          <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+                            <Badge text={it.severity === "high" ? "高风险" : "中风险"} tone={it.severity} />
+                            <span style={{ fontWeight: 700 }}>{it.rule_id}</span>
+                            <span style={{ color: "#333" }}>{it.reason || it.title}</span>
+                          </div>
+
+                          <div style={{ marginTop: 8, color: "#333" }}>
+                            <div style={{ fontSize: 13, color: "#666" }}>命中内容</div>
+                            <div style={{ whiteSpace: "pre-wrap" }}>{it.hit}</div>
+                          </div>
+
+                          <div style={{ marginTop: 8, color: "#333" }}>
+                            <div style={{ fontSize: 13, color: "#666" }}>问题说明</div>
+                            <div style={{ whiteSpace: "pre-wrap" }}>{it.message}</div>
+                          </div>
+
+                          <div style={{ marginTop: 8, color: "#333" }}>
+                            <div style={{ fontSize: 13, color: "#666" }}>修改建议</div>
+                            <div style={{ whiteSpace: "pre-wrap" }}>{it.suggestion}</div>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                ))
+              )}
+            </div>
+
+            {/* 复核项 */}
+            <div
+              style={{
+                border: "1px solid #eee",
+                borderRadius: 10,
+                padding: 14,
+                background: "#fff"
+              }}
+            >
+              <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 10 }}>
+                <h4 style={{ margin: 0 }}>需要复核的问题（review）</h4>
+                <span style={{ color: "#666", fontSize: 13 }}>
+                  这些点需要人工判断或后续接入AI复核
+                </span>
+              </div>
+
+              {review.length === 0 ? (
+                <div style={{ color: "#666" }}>无复核项</div>
+              ) : (
+                <div style={{ display: "grid", gap: 10 }}>
+                  {review.map((r) => (
+                    <div
+                      key={r.rule_id}
+                      style={{
+                        border: "1px solid #f0f0f0",
+                        borderRadius: 10,
+                        padding: 12,
+                        background: "#fafafa"
+                      }}
+                    >
+                      <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+                        <Badge text={r.severity === "high" ? "高" : "中"} tone={r.severity} />
+                        <span style={{ fontWeight: 700 }}>{r.rule_id}</span>
+                        <span style={{ color: "#333" }}>{r.title}</span>
+                      </div>
+
+                      <div style={{ marginTop: 8 }}>
+                        <div style={{ fontSize: 13, color: "#666" }}>复核要点</div>
+                        <ul style={{ marginTop: 6 }}>
+                          {(r.review_points || []).map((p, idx) => (
+                            <li key={idx}>{p}</li>
+                          ))}
+                        </ul>
+                      </div>
+
+                      <div style={{ marginTop: 8 }}>
+                        <div style={{ fontSize: 13, color: "#666" }}>处理建议</div>
+                        <div style={{ whiteSpace: "pre-wrap" }}>{r.instruction}</div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            {/* 原始JSON折叠查看 */}
+            <details style={{ border: "1px solid #eee", borderRadius: 10, padding: 14, background: "#fff" }}>
+              <summary style={{ cursor: "pointer" }}>查看原始 JSON</summary>
+              <pre style={{ background: "#f6f6f6", padding: 12, overflow: "auto", marginTop: 10 }}>
+                {JSON.stringify(result, null, 2)}
+              </pre>
+            </details>
+          </div>
+        )}
       </div>
     </div>
   );
 }
+
