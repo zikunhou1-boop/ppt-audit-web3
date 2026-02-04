@@ -148,8 +148,12 @@ export default function Home() {
       )}
 
       {/* AI 自动复核 */}
-      {aiResult?.ai && (
-        <div style={{ marginTop: 24 }}>
+      {aiResult && (
+  <div style={{ marginTop: 24 }}>
+    <h3>AI 自动复核（原样返回）</h3>
+    <pre>{JSON.stringify(aiResult, null, 2)}</pre>
+  </div>
+)}
           <h3>AI 自动复核结论</h3>
           {aiResult.ai.map((r) => (
             <div key={r.rule_id} style={{ border: "1px solid #eee", padding: 12, marginBottom: 10 }}>
