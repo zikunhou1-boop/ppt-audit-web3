@@ -2,149 +2,87 @@ import { useState } from "react";
 
 export default function Home() {
   const [file, setFile] = useState(null);
-  const [pages, setPages] = useState([]);
-  const [extractResult, setExtractResult] = useState(null);
+  const [loading, setLoading] = useState(false);
 
-  const [auditResult, setAuditResult] = useState(null);
-  const [aiResult, setAiResult] = useState(null);
+  const [result, setResult] = useState(null); // 最终结果（extract + audit + ai）
 
-  const [loadingExtract, setLoadingExtract] = useState(false);
-  const [loadingAudit, setLoadingAudit] = useState(false);
-  const [loadingAI, setLoadingAI] = useState(false);
-
-  async function onExtract() {
+  async function onRun() {
     if (!file) {
       alert("请先选择文件（ppt/pptx/docx/txt）");
       return;
     }
-    setLoadingExtract(true);
-    setExtractResult(null);
-    setPages([]);
-    setAuditResult(null);
-    setAiResult(null);
+    setLoading(true);
+    setResult(null);
 
     try {
+      // 1) Extract
       const fd = new FormData();
       fd.append("file", file);
 
-      const r = await fetch("/api/extract", {
-        method: "POST",
-        body: fd
-      });
-      const j = await r.json();
-      setExtractResult(j);
-
-      if (j && j.ok && Array.isArray(j.pages)) {
-        setPages(j.pages);
+      const r1 = await fetch("/api/extract", { method: "POST", body: fd });
+      const raw1 = await r1.text();
+      let extract;
+      try {
+        extract = JSON.parse(raw1);
+      } catch {
+        extract = { ok: false, http_status: r1.status, raw: raw1 };
       }
-    } catch (e) {
-      setExtractResult({ error: String(e) });
-    } finally {
-      setLoadingExtract(false);
-    }
-  }
 
-  async function onAudit() {
-    if (!pages || pages.length === 0) {
-      alert("请先提取内容（Extract）");
-      return;
-    }
-    setLoadingAudit(true);
-    setAuditResult(null);
-    setAiResult(null);
+      if (!extract.ok || !Array.isArray(extract.pages) || extract.pages.length === 0) {
+        setResult({ stage: "extract", extract });
+        return;
+      }
 
-    try {
-      const r = await fetch("/api/audit", {
+      // 2) Rules Audit
+      const r2 = await fetch("/api/audit", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ pages })
+        body: JSON.stringify({ pages: extract.pages })
       });
-      const j = await r.json();
-      setAuditResult(j);
+      const raw2 = await r2.text();
+      let audit;
+      try {
+        audit = JSON.parse(raw2);
+      } catch {
+        audit = { ok: false, http_status: r2.status, raw: raw2 };
+      }
+
+      // 3) AI Review（仅当有 issues）
+      let ai = null;
+      if (audit && Array.isArray(audit.issues) && audit.issues.length > 0) {
+        const text = (extract.pages || []).map((p) => p.content || "").join("\n");
+        const r3 = await fetch("/api/ai_review", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            text,
+            issues: audit.issues,
+            review: audit.review || []
+          })
+        });
+        const raw3 = await r3.text();
+        try {
+          ai = JSON.parse(raw3);
+        } catch {
+          ai = { ok: false, http_status: r3.status, raw: raw3 };
+        }
+      }
+
+      setResult({ stage: "done", extract, audit, ai });
     } catch (e) {
-      setAuditResult({ error: String(e) });
+      setResult({ stage: "client_error", error: String(e) });
     } finally {
-      setLoadingAudit(false);
+      setLoading(false);
     }
   }
 
-  async function onAIReview() {
-    if (!auditResult) {
-      alert("请先完成规则审核（Audit）");
-      return;
-    }
-    if (!auditResult?.issues || auditResult.issues.length === 0) {
-      alert("当前没有 issues，AI 复核没有目标");
-      return;
-    }
-
-    setLoadingAI(true);
-    setAiResult(null);
-
-    try {
-      const text = (pages || []).map((p) => p.content || "").join("\n");
-
-const r = await fetch("/api/extract", { method: "POST", body: fd });
-const raw = await r.text();
-
-// 先把原始返回显示出来（无论成功失败）
-let j;
-try {
-  j = JSON.parse(raw);
-} catch {
-  j = { http_status: r.status, raw };
-}
-setExtractResult(j);
-
-if (j && j.ok && Array.isArray(j.pages)) {
-  setPages(j.pages);
-}
-
-    } catch (e) {
-      setAiResult({ error: String(e) });
-    } finally {
-      setLoadingAI(false);
-    }
-  }
-
-  async function onTestAI() {
-    setLoadingAI(true);
-    setAiResult(null);
-    try {
-      const r = await fetch("/api/ai_review", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          text: "这是一个测试文本，保险产品，100%保证收益。",
-          issues: [
-            {
-              page: 1,
-              rule_id: "6-18",
-              severity: "medium",
-              type: "forbidden_terms",
-              hit: "100%",
-              reason: "禁止使用绝对化/最高级用语",
-              suggestion: "删除绝对化/最高级用语，改为可证实的客观描述并保留依据。",
-              message: "疑似使用绝对化/最高级用语。"
-            }
-          ],
-          review: []
-        })
-      });
-      const j = await r.json();
-      setAiResult(j);
-    } catch (e) {
-      setAiResult({ error: String(e) });
-    } finally {
-      setLoadingAI(false);
-    }
-  }
+  const pass = result?.audit?.pass === true;
 
   return (
-    <div style={{ maxWidth: 980, margin: "24px auto", padding: 16, fontFamily: "system-ui, -apple-system" }}>
+    <div style={{ maxWidth: 900, margin: "28px auto", padding: 16, fontFamily: "system-ui, -apple-system" }}>
       <h2>课件合规初审（规则 + AI）</h2>
 
-      <div style={{ padding: 12, border: "1px solid #ddd", borderRadius: 8 }}>
+      <div style={{ border: "1px solid #ddd", borderRadius: 10, padding: 14 }}>
         <div style={{ marginBottom: 10 }}>
           <input
             type="file"
@@ -153,51 +91,49 @@ if (j && j.ok && Array.isArray(j.pages)) {
           />
         </div>
 
-        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-          <button onClick={onExtract} disabled={loadingExtract}>
-            {loadingExtract ? "提取中..." : "1) Extract 提取内容"}
-          </button>
+        <button onClick={onRun} disabled={loading} style={{ padding: "8px 14px" }}>
+          {loading ? "审核中..." : "开始审核（自动提取 + 规则 + AI）"}
+        </button>
 
-          <button onClick={onAudit} disabled={loadingAudit || pages.length === 0}>
-            {loadingAudit ? "审核中..." : "2) Audit 规则审核"}
-          </button>
-
-          <button onClick={onAIReview} disabled={loadingAI || !auditResult}>
-            {loadingAI ? "AI 复核中..." : "3) AI 复核（对 issues 出改写）"}
-          </button>
-
-          <button onClick={onTestAI} disabled={loadingAI} style={{ marginLeft: 8 }}>
-            测试 AI 接口
-          </button>
+        <div style={{ marginTop: 12, color: "#666", fontSize: 13 }}>
+          支持：ppt/pptx/docx/txt（图片识别暂未开启）
         </div>
       </div>
 
       <div style={{ marginTop: 18 }}>
-        <h3>Extract 结果</h3>
-        <pre style={{ whiteSpace: "pre-wrap", background: "#f7f7f7", padding: 12, borderRadius: 8 }}>
-          {JSON.stringify(extractResult, null, 2)}
-        </pre>
-      </div>
+        <h3>结果</h3>
 
-      <div style={{ marginTop: 18 }}>
-        <h3>提取到的 pages（前 3 页预览）</h3>
-        <pre style={{ whiteSpace: "pre-wrap", background: "#f7f7f7", padding: 12, borderRadius: 8 }}>
-          {JSON.stringify((pages || []).slice(0, 3), null, 2)}
-        </pre>
-      </div>
+        {!result && <div style={{ color: "#666" }}>上传文件后点击“开始审核”。</div>}
 
-      <div style={{ marginTop: 18 }}>
-        <h3>规则审核结果 Audit</h3>
-        <pre style={{ whiteSpace: "pre-wrap", background: "#f7f7f7", padding: 12, borderRadius: 8 }}>
-          {JSON.stringify(auditResult, null, 2)}
-        </pre>
-      </div>
+        {result && result.stage === "extract" && (
+          <pre style={{ whiteSpace: "pre-wrap", background: "#f7f7f7", padding: 12, borderRadius: 8 }}>
+            {JSON.stringify(result, null, 2)}
+          </pre>
+        )}
 
-      <div style={{ marginTop: 18 }}>
-        <h3>AI 自动复核（原样返回）</h3>
-        <pre style={{ whiteSpace: "pre-wrap", background: "#f7f7f7", padding: 12, borderRadius: 8 }}>
-          {JSON.stringify(aiResult, null, 2)}
-        </pre>
+        {result && result.stage === "client_error" && (
+          <pre style={{ whiteSpace: "pre-wrap", background: "#f7f7f7", padding: 12, borderRadius: 8 }}>
+            {JSON.stringify(result, null, 2)}
+          </pre>
+        )}
+
+        {result && result.stage === "done" && (
+          <>
+            <div style={{ marginBottom: 8, fontWeight: 600 }}>
+              规则审核：{pass ? "通过" : "不通过"}（risk_level：{result.audit?.risk_level || "unknown"}）
+            </div>
+
+            <h4>规则命中 issues（已去重/汇总后）</h4>
+            <pre style={{ whiteSpace: "pre-wrap", background: "#f7f7f7", padding: 12, borderRadius: 8 }}>
+              {JSON.stringify(result.audit?.issues || [], null, 2)}
+            </pre>
+
+            <h4>AI 改写建议（对 issues 输出 before/after）</h4>
+            <pre style={{ whiteSpace: "pre-wrap", background: "#f7f7f7", padding: 12, borderRadius: 8 }}>
+              {JSON.stringify(result.ai || null, null, 2)}
+            </pre>
+          </>
+        )}
       </div>
     </div>
   );
