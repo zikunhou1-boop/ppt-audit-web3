@@ -84,18 +84,22 @@ export default function Home() {
     try {
       const text = (pages || []).map((p) => p.content || "").join("\n");
 
-      const r = await fetch("/api/ai_review", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          text,
-          issues: auditResult.issues,
-          review: auditResult.review || []
-        })
-      });
+const r = await fetch("/api/extract", { method: "POST", body: fd });
+const raw = await r.text();
 
-      const j = await r.json();
-      setAiResult(j);
+// 先把原始返回显示出来（无论成功失败）
+let j;
+try {
+  j = JSON.parse(raw);
+} catch {
+  j = { http_status: r.status, raw };
+}
+setExtractResult(j);
+
+if (j && j.ok && Array.isArray(j.pages)) {
+  setPages(j.pages);
+}
+
     } catch (e) {
       setAiResult({ error: String(e) });
     } finally {
