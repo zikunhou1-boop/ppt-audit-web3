@@ -2,6 +2,7 @@ import formidable from "formidable";
 import fs from "fs";
 import path from "path";
 import JSZip from "jszip";
+import mammoth from "mammoth";
 
 export const config = { api: { bodyParser: false } };
 
@@ -14,16 +15,6 @@ function decodeXmlText(s) {
     .replace(/&quot;/g, '"')
     .replace(/&#39;/g, "'")
     .replace(/&#x0?A;/g, "\n");
-}
-
-function stripTags(xml) {
-  return xml
-    .replace(/<w:tab\/?>/g, "\t")
-    .replace(/<w:br\/?>/g, "\n")
-    .replace(/<\/w:p>/g, "\n")
-    .replace(/<[^>]+>/g, "")
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
 }
 
 async function parsePptx(buffer) {
@@ -54,33 +45,13 @@ async function parsePptx(buffer) {
   }
 
   const nonEmpty = pages.filter((p) => (p.content || "").trim().length > 0);
-
   return { ok: true, pages_count: nonEmpty.length, pages: nonEmpty };
 }
 
 async function parseDocx(buffer) {
-  const zip = await JSZip.loadAsync(buffer);
-  const docXml = zip.file("word/document.xml");
-  if (!docXml) return { ok: false, error: "Invalid docx: missing word/document.xml" };
+  const result = await mammoth.extractRawText({ buffer });
+  const text = (result.value || "").trim();
 
-  const xml = await docXml.async("string");
-  const text = stripTags(decodeXmlText(xml));
-
-  // 简单分页：每 1500 字一页
-  const chunkSize = 1500;
-  const pages = [];
-  let i = 0;
-  let page = 1;
-  while (i < text.length) {
-    pages.push({ page, content: text.slice(i, i + chunkSize) });
-    i += chunkSize;
-    page += 1;
-  }
-  return { ok: true, pages_count: pages.length, pages };
-}
-
-async function parseTxt(buffer) {
-  const text = buffer.toString("utf-8");
   const chunkSize = 1500;
   const pages = [];
   let i = 0;
@@ -126,7 +97,7 @@ export default async function handler(req, res) {
     if (ext === ".pptx") out = await parsePptx(buffer);
     else if (ext === ".ppt") out = { ok: false, error: "暂不支持 .ppt（老格式），请另存为 .pptx" };
     else if (ext === ".docx") out = await parseDocx(buffer);
-    else if (ext === ".txt") out = await parseTxt(buffer);
+    else if (ext === ".txt") out = { ok: true, pages_count: 1, pages: [{ page: 1, content: buffer.toString("utf-8") }] };
     else out = { ok: false, error: `不支持的文件类型：${ext || "未知"}` };
 
     return res.status(200).json(out);
@@ -138,3 +109,4 @@ export default async function handler(req, res) {
     });
   }
 }
+
