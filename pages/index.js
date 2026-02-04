@@ -5,7 +5,6 @@ async function extractTextFromPptx(file) {
   const buf = await file.arrayBuffer();
   const zip = await JSZip.loadAsync(buf);
 
-  // 找所有 slide XML
   const slideFiles = Object.keys(zip.files)
     .filter((p) => /^ppt\/slides\/slide\d+\.xml$/.test(p))
     .sort((a, b) => {
@@ -37,10 +36,10 @@ async function extractTextFromPptx(file) {
 
 export default function Home() {
   const [text, setText] = useState("");
-  const [pptPages, setPptPages] = useState(null); // [{page, content}]
+  const [pptPages, setPptPages] = useState(null);
+  const [fileName, setFileName] = useState("");
   const [result, setResult] = useState(null);
   const [loading, setLoading] = useState(false);
-  const [fileName, setFileName] = useState("");
 
   async function onPickPptx(e) {
     const file = e.target.files?.[0];
@@ -54,7 +53,6 @@ export default function Home() {
       const pages = await extractTextFromPptx(file);
       setPptPages(pages);
 
-      // 可选：把解析出来的文本拼接展示在输入框
       const merged = pages.map((p) => `【第${p.page}页】\n${p.content}`).join("\n\n");
       setText(merged);
     } catch (err) {
@@ -70,7 +68,6 @@ export default function Home() {
     setLoading(true);
     setResult(null);
 
-    // 优先用 PPT pages（如果存在）；否则用文本框内容当作第1页
     const pagesPayload =
       Array.isArray(pptPages) && pptPages.length > 0
         ? pptPages
@@ -90,7 +87,6 @@ export default function Home() {
       } catch {
         data = { http_status: resp.status, raw };
       }
-
       setResult(data);
     } catch (e) {
       setResult({ error: String(e) });
@@ -105,7 +101,12 @@ export default function Home() {
 
       <div style={{ marginBottom: 12, display: "flex", gap: 12, alignItems: "center" }}>
         <input type="file" accept=".pptx" onChange={onPickPptx} disabled={loading} />
-        <span style={{ color: "#666" }}>{fileName ? `已选择：${fileName}` : "未选择PPTX"}</span>
+        <span style={{ color: "#666" }}>
+          {fileName ? `已选择：${fileName}` : "未选择PPTX"}
+        </span>
+        {pptPages && pptPages.length > 0 ? (
+          <span style={{ color: "#666" }}>已解析页数：{pptPages.length}</span>
+        ) : null}
       </div>
 
       <textarea
@@ -115,13 +116,17 @@ export default function Home() {
         value={text}
         onChange={(e) => {
           setText(e.target.value);
-          setPptPages(null); // 你手动改文本时，清掉 PPT pages，避免混用
+          setPptPages(null);
           setFileName("");
         }}
       />
 
       <div style={{ marginTop: 12, display: "flex", gap: 12 }}>
-        <button type="button" onClick={onAudit} disabled={loading || (!text.trim() && !(pptPages && pptPages.length))}>
+        <button
+          type="button"
+          onClick={onAudit}
+          disabled={loading || (!text.trim() && !(pptPages && pptPages.length))}
+        >
           {loading ? "审核中..." : "开始审核"}
         </button>
 
@@ -130,8 +135,8 @@ export default function Home() {
           onClick={() => {
             setText("");
             setPptPages(null);
-            setResult(null);
             setFileName("");
+            setResult(null);
           }}
           disabled={loading}
         >
@@ -151,20 +156,11 @@ export default function Home() {
         </button>
       </div>
 
-      <div style={{ marginTop: 20, color: "#666" }}>
-        {pptPages && pptPages.length > 0 ? `已解析PPT页数：${pptPages.length}（将按页审核）` : ""}
-      </div>
-
       <div style={{ marginTop: 24 }}>
         <h3>审核结果</h3>
         <pre style={{ background: "#f6f6f6", padding: 12, overflow: "auto" }}>
           {result ? JSON.stringify(result, null, 2) : "暂无"}
         </pre>
-      </div>
-    </div>
-  );
-}
-
       </div>
     </div>
   );
