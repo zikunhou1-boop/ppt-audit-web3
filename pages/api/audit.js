@@ -1,3 +1,4 @@
+// pages/api/audit.js
 import fs from "fs";
 import path from "path";
 
@@ -226,14 +227,46 @@ function audit(pages, rulesDoc) {
     }
   }
 
-  const hasHigh = issues.some((x) => x.severity === "high");
-  const risk_level = hasHigh ? "high" : issues.length ? "medium" : "low";
+  // ===== 1.1 去重：同一 rule_id + page + type + message 合并成一条 =====
+  function dedupeIssues(list) {
+    const map = new Map();
+
+    for (const it of list || []) {
+      const key = [it.rule_id || "", it.page ?? "", it.type || "", it.message || ""].join("__");
+
+      if (!map.has(key)) {
+        map.set(key, { ...it, hit: it.hit ? String(it.hit) : "" });
+        continue;
+      }
+
+      const prev = map.get(key);
+
+      // 合并 hit（把命中词合并，去重）
+      const a = prev.hit ? String(prev.hit).split("、") : [];
+      const b = it.hit ? [String(it.hit)] : [];
+      const merged = Array.from(new Set([...a, ...b].filter(Boolean)));
+      prev.hit = merged.join("、");
+
+      // reason/suggestion 保留更长的（避免丢信息）
+      if ((it.reason || "").length > (prev.reason || "").length) prev.reason = it.reason;
+      if ((it.suggestion || "").length > (prev.suggestion || "").length) prev.suggestion = it.suggestion;
+
+      map.set(key, prev);
+    }
+
+    return Array.from(map.values());
+  }
+
+  const issuesDeduped = dedupeIssues(issues);
+
+  const hasHigh = issuesDeduped.some((x) => x.severity === "high");
+  const risk_level = hasHigh ? "high" : issuesDeduped.length ? "medium" : "low";
 
   return {
-    pass: issues.length === 0,
+    pass: issuesDeduped.length === 0,
     risk_level,
     rule_version: rulesDoc.version || "",
-    issues,
+    issues: issuesDeduped,
     review
   };
 }
@@ -256,3 +289,4 @@ export default async function handler(req, res) {
     return res.status(500).json({ error: String(e), stack: e?.stack });
   }
 }
+
