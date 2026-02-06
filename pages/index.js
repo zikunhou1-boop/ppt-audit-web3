@@ -17,22 +17,15 @@ export default function Home() {
     }
   }
 
-  // 判定“AI report 是否真正有效”（必须包含 report 结构 + 有具体改写）
+  // ✅ 判定“AI 是否生效”：后端 ok:true 且 rules_issues_fix 非空即可
   function isAiReportEffective(aiReportRaw) {
     if (!aiReportRaw || typeof aiReportRaw !== "object") return false;
     if (aiReportRaw.ok !== true) return false;
-    if (!aiReportRaw.final_summary || typeof aiReportRaw.final_summary !== "object") return false;
     if (!Array.isArray(aiReportRaw.rules_issues_fix) || aiReportRaw.rules_issues_fix.length === 0) return false;
-
-    // 要求至少有一条 rewrite.after 是“具体句子”，不能全是空/模板
-    const hasRealAfter = aiReportRaw.rules_issues_fix.some((it) => {
-      const rw = Array.isArray(it?.rewrite) ? it.rewrite : [];
-      return rw.some((x) => typeof x?.after === "string" && x.after.trim().length >= 8);
-    });
-    return hasRealAfter;
+    return true;
   }
 
-  // ✅ 强制把 ai_report 规范化成 report 结构（仅用于展示；不再把兜底当成 AI）
+  // ✅ 规范化成 report 结构（只做展示转换，不做“兜底伪装成AI”）
   function normalizeAiReport(aiReportRaw) {
     if (!aiReportRaw || typeof aiReportRaw !== "object") return null;
 
@@ -125,7 +118,7 @@ export default function Home() {
         rulesOk = false;
       }
 
-      // 强制调用 AI（如果后端校验 rulesJson 为空会 400，这里会被识别为 AI 未生效）
+      // 强制调用 AI
       const r3 = await fetch("/api/ai_review", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -149,7 +142,7 @@ export default function Home() {
         aiUsed,
         rulesOk,
         aiHttpStatus: r3.status,
-        aiRaw: aiReportRaw // 只用于判断，不在页面展示 raw
+        aiRaw: aiReportRaw // ✅ 用于展示失败原因
       });
     } catch (e) {
       setResult({ stage: "error", message: "客户端异常", detail: String(e?.message || e) });
@@ -162,9 +155,8 @@ export default function Home() {
   const riskLevel = result?.audit?.risk_level || "unknown";
   const ai = result?.aiReport;
 
-  // 只在 AI 真生效时展示整改清单（避免把规则兜底当 AI）
-  const fixesToShow =
-    result?.aiUsed && Array.isArray(ai?.rules_issues_fix) ? ai.rules_issues_fix : [];
+  // 只在 AI 真生效时展示整改清单
+  const fixesToShow = result?.aiUsed && Array.isArray(ai?.rules_issues_fix) ? ai.rules_issues_fix : [];
 
   return (
     <div style={{ maxWidth: 900, margin: "28px auto", padding: 16, fontFamily: "system-ui, -apple-system" }}>
@@ -204,12 +196,38 @@ export default function Home() {
               规则审核：{auditPass ? "通过" : "不通过"}（risk_level：{riskLevel}）
             </div>
 
-            {/* ✅ 明确告诉你 AI 是否真正生效 */}
             <div style={{ marginBottom: 12, color: "#666", fontSize: 13 }}>
-              AI 融合复核：{result.aiUsed ? "已生效（AI 输出）" : `未生效（接口返回 ${result.aiHttpStatus}，请先修后端 /api/ai_review）`}
+              AI 融合复核：{result.aiUsed ? "已生效（AI 输出）" : `未生效（接口返回 ${result.aiHttpStatus}）`}
               {" · "}
               规则库读取：{result.rulesOk ? "正常" : "异常（/api/rules 可能没返回 rulesJson）"}
             </div>
+
+            {/* ✅ 未生效时直接展示原因（不用你去 Network 找） */}
+            {!result.aiUsed && result.aiRaw && (
+              <div style={{ border: "1px solid #eee", background: "#fafafa", borderRadius: 10, padding: 10, marginBottom: 12 }}>
+                <div style={{ fontWeight: 700, marginBottom: 6 }}>AI 未生效原因（/api/ai_review 返回）</div>
+
+                <div style={{ whiteSpace: "pre-wrap", fontSize: 13, color: "#444" }}>
+                  {result.aiRaw.error || result.aiRaw.detail || "（无 error/detail 字段）"}
+                </div>
+
+                {result.aiRaw.http_status ? (
+                  <div style={{ marginTop: 6, fontSize: 13, color: "#666" }}>DeepSeek http_status：{result.aiRaw.http_status}</div>
+                ) : null}
+
+                {result.aiRaw.raw ? (
+                  <div style={{ marginTop: 6, fontSize: 12, color: "#666", whiteSpace: "pre-wrap" }}>
+                    raw: {String(result.aiRaw.raw).slice(0, 800)}
+                  </div>
+                ) : null}
+
+                {result.aiRaw.content_preview ? (
+                  <div style={{ marginTop: 6, fontSize: 12, color: "#666", whiteSpace: "pre-wrap" }}>
+                    content_preview: {String(result.aiRaw.content_preview).slice(0, 800)}
+                  </div>
+                ) : null}
+              </div>
+            )}
 
             {/* 只有 AI 生效才展示融合报告 */}
             {result.aiUsed && ai?.final_summary ? (
@@ -247,7 +265,7 @@ export default function Home() {
 
             <h4>可落地整改清单（按规则命中项逐条给改写）</h4>
 
-            {Array.isArray(fixesToShow) && fixesToShow.length > 0 ? (
+            {fixesToShow.length > 0 ? (
               <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
                 {fixesToShow.map((it, idx) => (
                   <div key={idx} style={{ border: "1px solid #eee", borderRadius: 10, padding: 12 }}>
@@ -308,7 +326,7 @@ export default function Home() {
               </div>
             ) : (
               <div style={{ color: "#666" }}>
-                {result.aiUsed ? "（AI 未返回可用整改清单）" : "（AI 未生效：请先修后端 /api/ai_review，再重试）"}
+                {result.aiUsed ? "（AI 未返回可用整改清单）" : "（AI 未生效：请先看上方“AI 未生效原因”并修后端）"}
               </div>
             )}
 
@@ -330,4 +348,3 @@ export default function Home() {
     </div>
   );
 }
-
