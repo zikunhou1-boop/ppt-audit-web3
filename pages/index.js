@@ -17,84 +17,60 @@ export default function Home() {
     }
   }
 
-  // ✅ 强制把 ai_report 规范化成 report 结构（即使 AI 失败，也用 audit.issues 兜底）
-  function normalizeAiReport(aiReportRaw, audit) {
-    const issues = audit?.issues || [];
+  // 判定“AI report 是否真正有效”（必须包含 report 结构 + 有具体改写）
+  function isAiReportEffective(aiReportRaw) {
+    if (!aiReportRaw || typeof aiReportRaw !== "object") return false;
+    if (aiReportRaw.ok !== true) return false;
+    if (!aiReportRaw.final_summary || typeof aiReportRaw.final_summary !== "object") return false;
+    if (!Array.isArray(aiReportRaw.rules_issues_fix) || aiReportRaw.rules_issues_fix.length === 0) return false;
 
-    const fallback = {
-      ok: true,
-      final_summary: { overall: "", top_risks: [], next_actions: [] },
-      rules_issues_fix: issues.map((it) => ({
-        rule_id: it.rule_id,
-        page: it.page ?? null,
-        quote: it.quote ? [String(it.quote).slice(0, 80)] : [],
-        problem: it.problem || it.reason || it.message || "",
-        rewrite: [
-          {
-            action: "修改/补充",
-            before: it.quote || "",
-            after: it.suggestion || ""
-          }
-        ],
-        note: ""
-      })),
-      ai_extra: []
-    };
+    // 要求至少有一条 rewrite.after 是“具体句子”，不能全是空/模板
+    const hasRealAfter = aiReportRaw.rules_issues_fix.some((it) => {
+      const rw = Array.isArray(it?.rewrite) ? it.rewrite : [];
+      return rw.some((x) => typeof x?.after === "string" && x.after.trim().length >= 8);
+    });
+    return hasRealAfter;
+  }
 
-    // 1) 已是 report 结构且有整改清单
-    if (aiReportRaw?.final_summary && Array.isArray(aiReportRaw?.rules_issues_fix) && aiReportRaw.rules_issues_fix.length > 0) {
+  // ✅ 强制把 ai_report 规范化成 report 结构（仅用于展示；不再把兜底当成 AI）
+  function normalizeAiReport(aiReportRaw) {
+    if (!aiReportRaw || typeof aiReportRaw !== "object") return null;
+
+    // 已是 report 结构
+    if (aiReportRaw?.final_summary && Array.isArray(aiReportRaw?.rules_issues_fix)) {
       return {
-        ok: true,
+        ok: aiReportRaw.ok === true,
         final_summary: aiReportRaw.final_summary,
         rules_issues_fix: aiReportRaw.rules_issues_fix,
         ai_extra: Array.isArray(aiReportRaw.ai_extra) ? aiReportRaw.ai_extra : []
       };
     }
 
-    // 2) AI 接口直接报错/400/500：用兜底
-    if (aiReportRaw?.error || aiReportRaw?.ok === false) {
-      return fallback;
-    }
-
-    // 3) 兼容旧结构：{ ai: [...] }
+    // 兼容旧结构：{ ai: [...] }（转换成 report 结构展示）
     const legacy = aiReportRaw?.ai;
-    if (Array.isArray(legacy) && legacy.length > 0) {
-      const fixes = issues.map((it) => {
-        const hit =
-          legacy.find((x) => x?.rule_id === it.rule_id && (x?.page == null || x?.page === it.page)) ||
-          legacy.find((x) => x?.rule_id === it.rule_id) ||
-          null;
-
-        // 兼容 legacy 的 rewrite_suggestion
-        const rs = hit?.rewrite_suggestion;
-        const rw0 = Array.isArray(rs) && rs.length > 0 ? rs[0] : null;
-
-        return {
-          rule_id: it.rule_id,
-          page: it.page ?? null,
-          quote: Array.isArray(hit?.quote) ? hit.quote.slice(0, 3) : it.quote ? [String(it.quote).slice(0, 80)] : [],
-          problem: hit?.problem || it.problem || it.reason || it.message || "",
-          rewrite: [
-            {
-              action: rw0?.action || "修改/补充",
-              before: rw0?.before || it.quote || "",
-              after: rw0?.after || it.suggestion || ""
-            }
-          ],
-          note: hit?.notes || ""
-        };
-      });
-
+    if (Array.isArray(legacy)) {
       return {
         ok: true,
         final_summary: { overall: "", top_risks: [], next_actions: [] },
-        rules_issues_fix: fixes,
+        rules_issues_fix: legacy.map((x) => ({
+          rule_id: x.rule_id,
+          page: x.page ?? null,
+          quote: Array.isArray(x.quote) ? x.quote.slice(0, 3) : [],
+          problem: x.problem || "",
+          rewrite: Array.isArray(x.rewrite_suggestion)
+            ? x.rewrite_suggestion.slice(0, 3).map((r) => ({
+                action: r.action || "修改/补充",
+                before: r.before || "",
+                after: r.after || ""
+              }))
+            : [],
+          note: x.notes || ""
+        })),
         ai_extra: []
       };
     }
 
-    // 4) 其他未知结构：兜底
-    return fallback;
+    return null;
   }
 
   async function onRun() {
@@ -136,17 +112,20 @@ export default function Home() {
         .map((p) => `【第${p.page || ""}页】\n${p.content || ""}`)
         .join("\n\n");
 
-      // ✅ 从后端接口取 rulesJson（避免前端直接 /rules/rules.json 引发跨环境问题）
+      // 从后端接口取 rulesJson
       let rulesJson = "";
+      let rulesOk = false;
       try {
         const rr = await fetch("/api/rules");
         const j = await safeJson(rr);
         rulesJson = j?.rulesJson || "";
+        rulesOk = typeof rulesJson === "string" && rulesJson.trim().length > 0;
       } catch {
         rulesJson = "";
+        rulesOk = false;
       }
 
-      // 即使 rulesJson 为空，也照样发起 AI 调用（后端可能会校验；normalize 会兜底展示）
+      // 强制调用 AI（如果后端校验 rulesJson 为空会 400，这里会被识别为 AI 未生效）
       const r3 = await fetch("/api/ai_review", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -157,10 +136,21 @@ export default function Home() {
           rulesJson
         })
       });
-      const aiReportRaw = await safeJson(r3);
-      const aiReport = normalizeAiReport(aiReportRaw, audit);
 
-      setResult({ stage: "done", extract, audit, aiReport });
+      const aiReportRaw = await safeJson(r3);
+      const aiReport = normalizeAiReport(aiReportRaw);
+      const aiUsed = isAiReportEffective(aiReportRaw);
+
+      setResult({
+        stage: "done",
+        extract,
+        audit,
+        aiReport,
+        aiUsed,
+        rulesOk,
+        aiHttpStatus: r3.status,
+        aiRaw: aiReportRaw // 只用于判断，不在页面展示 raw
+      });
     } catch (e) {
       setResult({ stage: "error", message: "客户端异常", detail: String(e?.message || e) });
     } finally {
@@ -172,8 +162,9 @@ export default function Home() {
   const riskLevel = result?.audit?.risk_level || "unknown";
   const ai = result?.aiReport;
 
-  // ✅ 永远有整改清单（AI 成功优先用 AI；失败就用规则 issues 兜底）
-  const fixesToShow = Array.isArray(ai?.rules_issues_fix) ? ai.rules_issues_fix : [];
+  // 只在 AI 真生效时展示整改清单（避免把规则兜底当 AI）
+  const fixesToShow =
+    result?.aiUsed && Array.isArray(ai?.rules_issues_fix) ? ai.rules_issues_fix : [];
 
   return (
     <div style={{ maxWidth: 900, margin: "28px auto", padding: 16, fontFamily: "system-ui, -apple-system" }}>
@@ -209,13 +200,19 @@ export default function Home() {
 
         {result && result.stage === "done" && (
           <>
-            {/* 1) 规则结论（以 audit 为准） */}
             <div style={{ marginBottom: 10, fontWeight: 700 }}>
               规则审核：{auditPass ? "通过" : "不通过"}（risk_level：{riskLevel}）
             </div>
 
-            {/* 2) 融合报告：summary（AI 成功则更丰富；失败则为空，但不影响整改清单展示） */}
-            {ai?.final_summary ? (
+            {/* ✅ 明确告诉你 AI 是否真正生效 */}
+            <div style={{ marginBottom: 12, color: "#666", fontSize: 13 }}>
+              AI 融合复核：{result.aiUsed ? "已生效（AI 输出）" : `未生效（接口返回 ${result.aiHttpStatus}，请先修后端 /api/ai_review）`}
+              {" · "}
+              规则库读取：{result.rulesOk ? "正常" : "异常（/api/rules 可能没返回 rulesJson）"}
+            </div>
+
+            {/* 只有 AI 生效才展示融合报告 */}
+            {result.aiUsed && ai?.final_summary ? (
               <div style={{ border: "1px solid #eee", borderRadius: 10, padding: 12, marginBottom: 12 }}>
                 <div style={{ fontWeight: 700, marginBottom: 6 }}>融合报告（AI 在规则基础上给可落地改写）</div>
 
@@ -248,7 +245,6 @@ export default function Home() {
               </div>
             ) : null}
 
-            {/* 3) 可落地整改清单：永远展示（AI 优先，失败则规则兜底） */}
             <h4>可落地整改清单（按规则命中项逐条给改写）</h4>
 
             {Array.isArray(fixesToShow) && fixesToShow.length > 0 ? (
@@ -288,14 +284,14 @@ export default function Home() {
                               动作：{rw.action || "（无）"}
                             </div>
                             <div style={{ fontSize: 13, color: "#666" }}>before：</div>
-                            <div style={{ whiteSpace: "pre-wrap", marginBottom: 6 }}>{rw.before || "（缺失/无）"}</div>
+                            <div style={{ whiteSpace: "pre-wrap", marginBottom: 6 }}>{rw.before || "（无）"}</div>
                             <div style={{ fontSize: 13, color: "#666" }}>after：</div>
                             <div style={{ whiteSpace: "pre-wrap", fontWeight: 600 }}>{rw.after || "（无）"}</div>
                           </div>
                         ))}
                         {(!it.rewrite || it.rewrite.length === 0) && (
                           <div style={{ background: "#f7f7f7", borderRadius: 8, padding: 10, color: "#666" }}>
-                            （未返回改写建议）
+                            （AI 未返回改写建议）
                           </div>
                         )}
                       </div>
@@ -311,12 +307,13 @@ export default function Home() {
                 ))}
               </div>
             ) : (
-              <div style={{ color: "#666" }}>（未命中任何规则问题，暂无整改项）</div>
+              <div style={{ color: "#666" }}>
+                {result.aiUsed ? "（AI 未返回可用整改清单）" : "（AI 未生效：请先修后端 /api/ai_review，再重试）"}
+              </div>
             )}
 
-            {/* 4) AI 额外发现 */}
             <h4 style={{ marginTop: 14 }}>AI 额外发现（规则未覆盖/漏检的语义风险）</h4>
-            {Array.isArray(ai?.ai_extra) && ai.ai_extra.length > 0 ? (
+            {result.aiUsed && Array.isArray(ai?.ai_extra) && ai.ai_extra.length > 0 ? (
               <ul style={{ margin: 0, paddingLeft: 18 }}>
                 {ai.ai_extra.slice(0, 10).map((x, i) => (
                   <li key={i} style={{ whiteSpace: "pre-wrap" }}>
