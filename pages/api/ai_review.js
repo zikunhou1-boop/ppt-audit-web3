@@ -119,16 +119,49 @@ export default async function handler(req, res) {
 - rewrite[0].after 必须是可直接替换进课件的具体句子（完整可粘贴），不得只写原则/口径。
 - 如果原文没有对应句子，也要在 quote 写“原文未出现明确句子：……（说明位置）”，并给出建议补充的 after 文案。`.trim();
 
-      const user = `
-【全文（按页）】
-${pagesText}
+      // ✅ 瘦身：只给“命中的 issues + 对应页文本”，不要把全文和整份 rules.json 全塞进去
+const issues = Array.isArray(audit?.issues) ? audit.issues : [];
+const pages = typeof pagesText === "string" ? pagesText : "";
 
-【规则库（rulesJson）】
-${rulesJson}
+// 只取每条 issue 对应的页（最多取前 8 条 issue，避免过大）
+const issuesSlim = issues.slice(0, 8).map((it) => ({
+  rule_id: it.rule_id,
+  page: it.page ?? null,
+  quote: it.quote || "",
+  problem: it.problem || it.reason || it.message || "",
+  suggestion: it.suggestion || ""
+}));
 
-【规则初审结果（audit）】
-${JSON.stringify(audit, null, 2)}
+// 从 pagesText 里按“【第X页】”切块，只取命中页的内容（每页最多 1200 字）
+function pickPageBlock(all, pageNo) {
+  if (pageNo == null) return "";
+  const marker = `【第${pageNo}页】`;
+  const idx = all.indexOf(marker);
+  if (idx < 0) return "";
+  const nextIdx = all.indexOf("【第", idx + marker.length);
+  const block = nextIdx < 0 ? all.slice(idx) : all.slice(idx, nextIdx);
+  return block.slice(0, 1200);
+}
+
+const pageBlocks = issuesSlim
+  .map((it) => pickPageBlock(pages, it.page))
+  .filter(Boolean)
+  .join("\n\n");
+
+// rulesJson 不再全量给，只给“你系统提示里需要的关键点”即可；否则太大
+const rulesSlim = (typeof rulesJson === "string" ? rulesJson : "").slice(0, 2000);
+
+user = `
+【命中页原文（仅抽取命中页，已截断）】
+${pageBlocks}
+
+【规则初审 issues（已瘦身）】
+${JSON.stringify(issuesSlim, null, 2)}
+
+【规则库摘要（已截断）】
+${rulesSlim}
 `.trim();
+
 
       // ===== Call DeepSeek（任何失败都不 return error，直接走兜底）=====
       try {
