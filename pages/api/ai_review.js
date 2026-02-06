@@ -1,3 +1,4 @@
+// pages/api/ai_review.js
 export default async function handler(req, res) {
   try {
     if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
@@ -172,67 +173,63 @@ ${JSON.stringify(review, null, 2)}
       return res.status(500).json({ error: "Model content is not JSON", content });
     }
 
-    // ===== 兜底字段 =====
+    // ===== 兜底字段 + 强兜底生成整改清单 =====
     if (!parsed || typeof parsed !== "object") parsed = {};
-// ===== report 模式：强兜底，保证 rules_issues_fix 一定有 =====
-if (mode === "report") {
-  if (!parsed || typeof parsed !== "object") parsed = {};
-  parsed.ok = true;
 
-  if (!parsed.final_summary || typeof parsed.final_summary !== "object") {
-    parsed.final_summary = { overall: "", top_risks: [], next_actions: [] };
-  }
-  if (typeof parsed.final_summary.overall !== "string") parsed.final_summary.overall = "";
-  if (!Array.isArray(parsed.final_summary.top_risks)) parsed.final_summary.top_risks = [];
-  if (!Array.isArray(parsed.final_summary.next_actions)) parsed.final_summary.next_actions = [];
+    if (mode === "report") {
+      parsed.ok = true;
 
-  if (!Array.isArray(parsed.ai_extra)) parsed.ai_extra = [];
+      if (!Array.isArray(parsed.ai_extra)) parsed.ai_extra = [];
 
-  var issues = audit && Array.isArray(audit.issues) ? audit.issues : [];
+      if (!parsed.final_summary || typeof parsed.final_summary !== "object") {
+        parsed.final_summary = { overall: "", top_risks: [], next_actions: [] };
+      }
+      if (typeof parsed.final_summary.overall !== "string") parsed.final_summary.overall = "";
+      if (!Array.isArray(parsed.final_summary.top_risks)) parsed.final_summary.top_risks = [];
+      if (!Array.isArray(parsed.final_summary.next_actions)) parsed.final_summary.next_actions = [];
 
-  function oneFix(it) {
-    return {
-      rule_id: it.rule_id,
-      page: it.page === undefined ? null : it.page,
-      quote: it.quote ? [String(it.quote)] : [],
-      problem: it.problem || it.reason || it.message || "",
-      rewrite: [
-        {
-          action: "修改/补充",
-          before: it.quote || "",
-          after: it.suggestion || ""
+      const issues = audit && Array.isArray(audit.issues) ? audit.issues : [];
+
+      const oneFix = (it) => ({
+        rule_id: it.rule_id,
+        page: it.page === undefined ? null : it.page,
+        quote: it.quote ? [String(it.quote).slice(0, 80)] : [],
+        problem: it.problem || it.reason || it.message || "",
+        rewrite: [
+          {
+            action: "修改/补充",
+            before: it.quote || "",
+            after: it.suggestion || ""
+          }
+        ],
+        note: ""
+      });
+
+      // 如果 AI 没给或给空，直接用 issues 生成
+      if (!Array.isArray(parsed.rules_issues_fix) || parsed.rules_issues_fix.length === 0) {
+        parsed.rules_issues_fix = issues.map(oneFix);
+      }
+
+      // 补齐缺失：确保每条 issue 都有一条 fix
+      const existed = new Set(
+        parsed.rules_issues_fix.map((x) => `${x?.rule_id || ""}__${x?.page === undefined ? "" : x.page}`)
+      );
+
+      for (const it of issues) {
+        const key = `${it.rule_id || ""}__${it.page === undefined ? "" : it.page}`;
+        if (!existed.has(key)) {
+          parsed.rules_issues_fix.push(oneFix(it));
+          existed.add(key);
         }
-      ],
-      note: ""
-    };
-  }
+      }
 
-  // 如果 AI 没给或给空，直接用 issues 生成
-  if (!Array.isArray(parsed.rules_issues_fix) || parsed.rules_issues_fix.length === 0) {
-    parsed.rules_issues_fix = issues.map(oneFix);
-  }
-
-  // 再强制补齐：确保每条 issue 都有一条 fix
-  var existed = {};
-  for (var i = 0; i < parsed.rules_issues_fix.length; i++) {
-    var x = parsed.rules_issues_fix[i] || {};
-    var k = String(x.rule_id || "") + "__" + String(x.page === undefined ? "" : x.page);
-    existed[k] = true;
-  }
-  for (var j = 0; j < issues.length; j++) {
-    var it = issues[j];
-    var key = String(it.rule_id || "") + "__" + String(it.page === undefined ? "" : it.page);
-    if (!existed[key]) {
-      parsed.rules_issues_fix.push(oneFix(it));
-      existed[key] = true;
+      return res.status(200).json(parsed);
+    } else {
+      if (!Array.isArray(parsed.ai)) parsed.ai = [];
+      // 保持兼容：legacy 透传模型返回字段，同时确保 ok=true
+      return res.status(200).json({ ok: true, ...parsed });
     }
+  } catch (e) {
+    return res.status(500).json({ error: String(e), stack: e?.stack });
   }
-
-  return res.status(200).json(parsed);
 }
-
-// ===== legacy 模式 =====
-if (!parsed || typeof parsed !== "object") parsed = {};
-if (!Array.isArray(parsed.ai)) parsed.ai = [];
-return res.status(200).json({ ok: true, ai: parsed.ai });
-
