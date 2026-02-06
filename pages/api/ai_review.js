@@ -26,7 +26,7 @@ export default async function handler(req, res) {
       if (!audit) return res.status(400).json({ ok: false, error: "report mode requires audit(object)" });
     }
 
-    // ====== 强制“像 AI”的 system prompt（必须给 quote/before/after，不能写缺失/无） ======
+    // ====== system prompt ======
     const system_report = `
 你是保险课件/宣传材料合规复审助手。你要在规则初审(audit)基础上复核，并输出结构化融合结果。
 
@@ -61,18 +61,18 @@ export default async function handler(req, res) {
 { "ai": [ { "rule_id": "...", "verdict": "...", "quote": [], "problem": "", "rewrite_suggestion": [{ "action": "", "before": "", "after": "" }], "notes": "" } ] }
 `.trim();
 
-    // ====== report 模式：自动“瘦身”输入（避免慢/超时/不稳定） ======
+    // ====== report 模式：输入瘦身（更激进，降低超时概率） ======
     const issues = Array.isArray(audit?.issues) ? audit.issues : [];
 
-    // 只取前 10 条 issue（太多会慢；后续你要全量可做分页/批处理）
-    const issuesSlim = issues.slice(0, 10).map((it) => ({
+    // ✅ 只取前 5 条 issue（10 太容易慢/超时）
+    const issuesSlim = issues.slice(0, 5).map((it) => ({
       rule_id: it.rule_id,
       page: it.page ?? null,
       message: it.message || it.problem || it.reason || "",
       suggestion: it.suggestion || ""
     }));
 
-    // 从 pagesText 里按“【第X页】”切块，抽取命中页内容，每页最多 1500 字
+    // ✅ 单页最多 800 字
     function pickPageBlock(all, pageNo) {
       if (pageNo == null) return "";
       const marker = `【第${pageNo}页】`;
@@ -80,17 +80,18 @@ export default async function handler(req, res) {
       if (idx < 0) return "";
       const nextIdx = all.indexOf("【第", idx + marker.length);
       const block = nextIdx < 0 ? all.slice(idx) : all.slice(idx, nextIdx);
-      return block.slice(0, 1500);
+      return block.slice(0, 800);
     }
 
+    // ✅ 总长度最多 6000
     const pageBlocks = issuesSlim
       .map((it) => pickPageBlock(pagesText || "", it.page))
       .filter(Boolean)
       .join("\n\n")
-      .slice(0, 12000); // 总长度再兜底
+      .slice(0, 6000);
 
-    // rulesJson 只给摘要，避免巨大
-    const rulesSlim = (rulesJson || "").slice(0, 2000);
+    // ✅ rulesJson 摘要最多 800
+    const rulesSlim = (rulesJson || "").slice(0, 800);
 
     let system = mode === "report" ? system_report : system_legacy;
     let user =
@@ -113,9 +114,9 @@ ${text}
 ${JSON.stringify(review, null, 2)}
 `.trim();
 
-    // ====== 调 DeepSeek（带超时） ======
+    // ====== 调 DeepSeek（超时拉长到 110s） ======
     const controller = new AbortController();
-    const t = setTimeout(() => controller.abort(), 55000);
+    const t = setTimeout(() => controller.abort(), 110000);
 
     let raw = "";
     let httpStatus = 0;
@@ -133,7 +134,9 @@ ${JSON.stringify(review, null, 2)}
             { role: "system", content: system },
             { role: "user", content: user }
           ],
-          temperature: 0.1
+          temperature: 0.1,
+          // 如果服务端支持，会强制 JSON；不支持通常会忽略
+          response_format: { type: "json_object" }
         }),
         signal: controller.signal
       });
@@ -160,7 +163,7 @@ ${JSON.stringify(review, null, 2)}
       clearTimeout(t);
     }
 
-    // ====== 解析 DeepSeek 返回（容错：模型不是严格 JSON 时提取大括号） ======
+    // ====== 解析 DeepSeek 返回（容错） ======
     function extractJsonObject(s) {
       if (typeof s !== "string") return null;
       const first = s.indexOf("{");
@@ -192,7 +195,6 @@ ${JSON.stringify(review, null, 2)}
       }
     }
 
-    // ====== 最终兜底：永远返回 report 结构（但 ok=false 表示 AI 没真正产出） ======
     if (!parsed || typeof parsed !== "object") {
       return res.status(200).json({
         ok: false,
