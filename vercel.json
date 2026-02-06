@@ -1,5 +1,7 @@
 {
   "functions": {
-    "pages/api/*.js": { "maxDuration": 30 }
+    "pages/api/ai_review.js": {
+      "maxDuration": 60
+    }
   }
 }
