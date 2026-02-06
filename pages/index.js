@@ -1,3 +1,4 @@
+// pages/index.js
 import { useState } from "react";
 
 export default function Home() {
@@ -14,6 +15,47 @@ export default function Home() {
     } catch {
       return { ok: false, http_status: resp.status, raw };
     }
+  }
+
+  function normalizeAiReport(aiReport, audit) {
+    // 已是 report 结构
+    if (aiReport?.final_summary && Array.isArray(aiReport?.rules_issues_fix)) return aiReport;
+
+    // 兼容旧结构：{ ai: [...] }
+    const legacy = aiReport?.ai;
+    if (Array.isArray(legacy)) {
+      return {
+        final_summary: {
+          overall: "",
+          top_risks: [],
+          next_actions: []
+        },
+        rules_issues_fix: (audit?.issues || []).map((it) => {
+          const hit =
+            legacy.find((x) => x?.rule_id === it.rule_id && (x?.page == null || x?.page === it.page)) ||
+            legacy.find((x) => x?.rule_id === it.rule_id) ||
+            null;
+
+          return {
+            rule_id: it.rule_id,
+            page: it.page,
+            quote: it.quote ? [it.quote] : [],
+            problem: it.problem || it.reason || it.message || "",
+            rewrite: [
+              {
+                action: hit?.action || "修改/补充",
+                before: hit?.before || it.quote || "",
+                after: hit?.after || it.suggestion || ""
+              }
+            ].filter((x) => x.before || x.after),
+            note: hit?.notes || ""
+          };
+        }),
+        ai_extra: []
+      };
+    }
+
+    return aiReport;
   }
 
   async function onRun() {
@@ -33,7 +75,7 @@ export default function Home() {
       const extract = await safeJson(r1);
 
       if (!extract.ok || !Array.isArray(extract.pages) || extract.pages.length === 0) {
-        setResult({ stage: "extract", extract });
+        setResult({ stage: "error", message: "提取失败：未获取到页面内容", detail: extract });
         return;
       }
 
@@ -45,39 +87,44 @@ export default function Home() {
       });
       const audit = await safeJson(r2);
 
+      if (!audit || typeof audit !== "object") {
+        setResult({ stage: "error", message: "规则审核失败：返回异常", detail: audit });
+        return;
+      }
+
       // 3) AI Review（report 模式：融合报告）
-      let aiReport = null;
       const pagesText = (extract.pages || [])
         .map((p) => `【第${p.page || ""}页】\n${p.content || ""}`)
         .join("\n\n");
 
-      // 读取 rules.json（前端 public/rules/rules.json 可直接 fetch）
-      // 你的 rules.json 在 /rules/rules.json（和你之前用的一样）
+      // ✅ 从后端接口取 rulesJson（避免前端直接 /rules/rules.json 404）
       let rulesJson = "";
       try {
-        const rr = await fetch("/rules/rules.json");
-        rulesJson = await rr.text();
+        const rr = await fetch("/api/rules");
+        const j = await safeJson(rr);
+        rulesJson = j?.rulesJson || "";
       } catch {
         rulesJson = "";
       }
 
-      if (audit && typeof audit === "object") {
-        const r3 = await fetch("/api/ai_review", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            mode: "report",
-            pagesText,
-            audit,
-            rulesJson
-          })
-        });
-        aiReport = await safeJson(r3);
-      }
+      let aiReportRaw = null;
+      const r3 = await fetch("/api/ai_review", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          mode: "report",
+          pagesText,
+          audit,
+          rulesJson
+        })
+      });
+      aiReportRaw = await safeJson(r3);
+
+      const aiReport = normalizeAiReport(aiReportRaw, audit);
 
       setResult({ stage: "done", extract, audit, aiReport });
     } catch (e) {
-      setResult({ stage: "client_error", error: String(e?.message || e) });
+      setResult({ stage: "error", message: "客户端异常", detail: String(e?.message || e) });
     } finally {
       setLoading(false);
     }
@@ -85,7 +132,6 @@ export default function Home() {
 
   const auditPass = result?.audit?.pass === true;
   const riskLevel = result?.audit?.risk_level || "unknown";
-  const issues = result?.audit?.issues || [];
   const ai = result?.aiReport;
 
   return (
@@ -105,9 +151,7 @@ export default function Home() {
           {loading ? "审核中..." : "一键审核（提取 → 规则 → AI融合报告）"}
         </button>
 
-        <div style={{ marginTop: 12, color: "#666", fontSize: 13 }}>
-          支持：ppt/pptx/docx/txt（图片识别暂未开启）
-        </div>
+        <div style={{ marginTop: 12, color: "#666", fontSize: 13 }}>支持：ppt/pptx/docx/txt（图片识别暂未开启）</div>
       </div>
 
       <div style={{ marginTop: 18 }}>
@@ -115,10 +159,11 @@ export default function Home() {
 
         {!result && <div style={{ color: "#666" }}>上传文件后点击“一键审核”。</div>}
 
-        {result && (result.stage === "extract" || result.stage === "client_error") && (
-          <pre style={{ whiteSpace: "pre-wrap", background: "#f7f7f7", padding: 12, borderRadius: 8 }}>
-            {JSON.stringify(result, null, 2)}
-          </pre>
+        {result && result.stage === "error" && (
+          <div style={{ border: "1px solid #f0d7d7", background: "#fff5f5", borderRadius: 10, padding: 12 }}>
+            <div style={{ fontWeight: 700, marginBottom: 6 }}>失败</div>
+            <div style={{ whiteSpace: "pre-wrap" }}>{result.message || "（无）"}</div>
+          </div>
         )}
 
         {result && result.stage === "done" && (
@@ -128,8 +173,8 @@ export default function Home() {
               规则审核：{auditPass ? "通过" : "不通过"}（risk_level：{riskLevel}）
             </div>
 
-            {/* 2) 融合报告：优先展示可读 summary + rules_issues_fix */}
-            {ai && ai.final_summary && (
+            {/* 2) 融合报告：summary */}
+            {ai?.final_summary ? (
               <div style={{ border: "1px solid #eee", borderRadius: 10, padding: 12, marginBottom: 12 }}>
                 <div style={{ fontWeight: 700, marginBottom: 6 }}>融合报告（AI 在规则基础上给可落地改写）</div>
 
@@ -160,9 +205,9 @@ export default function Home() {
                   </div>
                 </div>
               </div>
-            )}
+            ) : null}
 
-            {/* 3) 对每条 rules issue 给“可直接改”的 before/after（来自 rules_issues_fix） */}
+            {/* 3) 可落地整改清单 */}
             <h4>可落地整改清单（按规则命中项逐条给改写）</h4>
 
             {Array.isArray(ai?.rules_issues_fix) && ai.rules_issues_fix.length > 0 ? (
@@ -225,39 +270,26 @@ export default function Home() {
                 ))}
               </div>
             ) : (
-              <div style={{ color: "#666" }}>
-                （暂未生成融合整改清单。若 AI 返回的是旧结构，请确认 /api/ai_review 已启用 report 模式，并且前端已传 mode:"report"）
-              </div>
+              <div style={{ color: "#666" }}>（未生成整改清单：请检查 /api/ai_review 是否成功返回 report 结构）</div>
             )}
 
-            {/* 4) AI 额外发现（可选） */}
+            {/* 4) AI 额外发现（可选，保留为可读列表而非 JSON） */}
             <h4 style={{ marginTop: 14 }}>AI 额外发现（规则未覆盖/漏检的语义风险）</h4>
             {Array.isArray(ai?.ai_extra) && ai.ai_extra.length > 0 ? (
-              <pre style={{ whiteSpace: "pre-wrap", background: "#f7f7f7", padding: 12, borderRadius: 8 }}>
-                {JSON.stringify(ai.ai_extra, null, 2)}
-              </pre>
+              <ul style={{ margin: 0, paddingLeft: 18 }}>
+                {ai.ai_extra.slice(0, 10).map((x, i) => (
+                  <li key={i} style={{ whiteSpace: "pre-wrap" }}>
+                    {typeof x === "string" ? x : JSON.stringify(x)}
+                  </li>
+                ))}
+              </ul>
             ) : (
               <div style={{ color: "#666" }}>（无）</div>
             )}
-
-            {/* 5) 规则初审原始 issues（可折叠） */}
-            <details style={{ marginTop: 14 }}>
-              <summary style={{ cursor: "pointer" }}>查看规则命中 issues（原始 JSON）</summary>
-              <pre style={{ whiteSpace: "pre-wrap", background: "#f7f7f7", padding: 12, borderRadius: 8 }}>
-                {JSON.stringify(issues, null, 2)}
-              </pre>
-            </details>
-
-            {/* 6) Debug：extract/audit/ai 原文（可折叠） */}
-            <details style={{ marginTop: 10 }}>
-              <summary style={{ cursor: "pointer" }}>调试信息（extract / audit / aiReport 原始）</summary>
-              <pre style={{ whiteSpace: "pre-wrap", background: "#f7f7f7", padding: 12, borderRadius: 8 }}>
-                {JSON.stringify({ extract: result.extract, audit: result.audit, aiReport: result.aiReport }, null, 2)}
-              </pre>
-            </details>
           </>
         )}
       </div>
     </div>
   );
 }
+
