@@ -3,8 +3,7 @@ import path from "path";
 
 export default function handler(req, res) {
   try {
-    // 规则文件在仓库根目录：rules.json
-    const p = path.join(process.cwd(), "rules.json");
+    const p = path.join(process.cwd(), "rules", "rules.json"); // ✅ 正确路径
     const text = fs.readFileSync(p, "utf-8");
     res.status(200).json({ ok: true, rulesJson: text });
   } catch (e) {
