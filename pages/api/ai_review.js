@@ -3,21 +3,17 @@ export default async function handler(req, res) {
   try {
     if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
 
-    const apiKey = process.env.DEEPSEEK_API_KEY;
-    if (!apiKey) return res.status(500).json({ error: "Missing env: DEEPSEEK_API_KEY" });
-
-    // 兼容两种输入：
-    // A) 旧：{ text, review }
-    // B) 新：{ pagesText, audit, rulesJson }
     const body = req.body || {};
+    const mode = body.mode === "report" ? "report" : "legacy";
+
+    // legacy 输入
     const text = typeof body.text === "string" ? body.text : null;
     const review = Array.isArray(body.review) ? body.review : null;
 
+    // report 输入
     const pagesText = typeof body.pagesText === "string" ? body.pagesText : null;
     const audit = body.audit && typeof body.audit === "object" ? body.audit : null;
     const rulesJson = typeof body.rulesJson === "string" ? body.rulesJson : null;
-
-    const mode = body.mode === "report" ? "report" : "legacy";
 
     // 参数校验
     if (mode === "legacy") {
@@ -30,8 +26,48 @@ export default async function handler(req, res) {
       }
     }
 
-    // ===== System Prompt（融合版：规则为准 + AI 可补充 ai_extra + 对 issues 给改写）=====
-    const system_report = `
+    // ===== report 兜底构造：无论 AI 成功与否，都要返回完整结构 =====
+    const buildReportFallback = () => {
+      const issues = audit && Array.isArray(audit.issues) ? audit.issues : [];
+      return {
+        ok: true,
+        rules_issues_fix: issues.map((it) => ({
+          rule_id: it.rule_id,
+          page: it.page === undefined ? null : it.page,
+          quote: it.quote ? [String(it.quote).slice(0, 80)] : [],
+          problem: it.problem || it.reason || it.message || "",
+          rewrite: [
+            {
+              action: "修改/补充",
+              before: it.quote || "",
+              after: it.suggestion || ""
+            }
+          ],
+          note: ""
+        })),
+        ai_extra: [],
+        final_summary: {
+          overall: "",
+          top_risks: [],
+          next_actions: []
+        }
+      };
+    };
+
+    // 如果是 report 模式：即使没有 API Key，也返回兜底报告（保证有整改清单）
+    if (mode === "report") {
+      const apiKey = process.env.DEEPSEEK_API_KEY;
+
+      // 先准备兜底结构（后面 AI 成功就覆盖/补充）
+      let parsed = buildReportFallback();
+
+      // 没 key：直接返回兜底（不会再“未生成整改清单”）
+      if (!apiKey) {
+        return res.status(200).json(parsed);
+      }
+
+      // ===== System Prompt（融合版）=====
+      const system_report = `
 你是保险课件/宣传材料合规复审助手。你要在“规则初审(audit)”基础上复审全文，并产出结构化融合结果，供生成可读报告。
 
 核心原则（必须遵守）：
@@ -78,15 +114,94 @@ export default async function handler(req, res) {
 - rewrite 至少 1 条、最多 3 条，每条必须给 after。
 `.trim();
 
-    // ===== System Prompt（旧版：对 review 输出 before/after）=====
+      const user = `
+【全文（按页）】
+${pagesText}
+
+【规则库（rulesJson）】
+${rulesJson}
+
+【规则初审结果（audit）】
+${JSON.stringify(audit, null, 2)}
+`.trim();
+
+      // ===== Call DeepSeek（任何失败都不 return error，直接走兜底）=====
+      try {
+        const resp = await fetch("https://api.deepseek.com/chat/completions", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${apiKey}`
+          },
+          body: JSON.stringify({
+            model: "deepseek-chat",
+            messages: [
+              { role: "system", content: system_report },
+              { role: "user", content: user }
+            ],
+            temperature: 0.1,
+            response_format: { type: "json_object" }
+          })
+        });
+
+        const raw = await resp.text();
+        if (resp.ok) {
+          const data = JSON.parse(raw);
+          const content = data?.choices?.[0]?.message?.content || "";
+          const modelObj = JSON.parse(content);
+
+          // 合并：模型给的结构优先，但必须保证每条 issue 有 fix；缺的用兜底补齐
+          if (modelObj && typeof modelObj === "object") {
+            parsed.final_summary =
+              modelObj.final_summary && typeof modelObj.final_summary === "object"
+                ? {
+                    overall: String(modelObj.final_summary.overall || ""),
+                    top_risks: Array.isArray(modelObj.final_summary.top_risks) ? modelObj.final_summary.top_risks : [],
+                    next_actions: Array.isArray(modelObj.final_summary.next_actions) ? modelObj.final_summary.next_actions : []
+                  }
+                : parsed.final_summary;
+
+            parsed.ai_extra = Array.isArray(modelObj.ai_extra) ? modelObj.ai_extra : parsed.ai_extra;
+
+            if (Array.isArray(modelObj.rules_issues_fix) && modelObj.rules_issues_fix.length > 0) {
+              parsed.rules_issues_fix = modelObj.rules_issues_fix;
+            }
+
+            // 再补齐缺失：确保 audit.issues 都被覆盖
+            const issues = audit && Array.isArray(audit.issues) ? audit.issues : [];
+            const existed = new Set(
+              (parsed.rules_issues_fix || []).map((x) => `${x?.rule_id || ""}__${x?.page === undefined ? "" : x.page}`)
+            );
+
+            for (const it of issues) {
+              const key = `${it.rule_id || ""}__${it.page === undefined ? "" : it.page}`;
+              if (!existed.has(key)) {
+                parsed.rules_issues_fix.push(
+                  ...buildReportFallback().rules_issues_fix.filter(
+                    (z) => `${z.rule_id}__${z.page === undefined ? "" : z.page}` === key
+                  )
+                );
+                existed.add(key);
+              }
+            }
+          }
+        }
+      } catch {
+        // 忽略，返回兜底 parsed
+      }
+
+      parsed.ok = true;
+      return res.status(200).json(parsed);
+    }
+
+    // ===== legacy 模式：保持原逻辑（无 key 仍报错）=====
+    const apiKey = process.env.DEEPSEEK_API_KEY;
+    if (!apiKey) return res.status(500).json({ error: "Missing env: DEEPSEEK_API_KEY" });
+
     const system_legacy = `
 你是保险宣传/课件材料合规审核助手。你的任务：依据给定“复核项(review)”对材料文本进行复核，并输出可直接落地修改的结果。
 
-硬性要求：
-1) 必须定位到原文句子或短语（quote）。
-2) 尽量保留事实数据；如保留数据，必须避免不当对比/排序/评比、制造紧迫感、保证承诺、绝对化用语；必要时补充数据口径/来源/时间。
-3) 每个 rule_id 输出一条结果：verdict + quote + problem + rewrite_suggestion（before/after）。
-4) 输出必须是严格 JSON，结构如下：
+输出必须是严格 JSON，结构如下：
 {
   "ai": [
     {
@@ -101,42 +216,17 @@ export default async function handler(req, res) {
     }
   ]
 }
-
-输出约束：
-- 必须输出 JSON，不能有任何多余文字。
-- quote 最多给 3 条，每条不超过 80 字。
-- rewrite_suggestion 至少 1 条，最多 5 条，必须给出 after。
 `.trim();
 
-    // ===== User Prompt（按模式组装）=====
-    let user;
-    let system;
-
-    if (mode === "report") {
-      system = system_report;
-      user = `
-【全文（按页）】
-${pagesText}
-
-【规则库（rulesJson）】
-${rulesJson}
-
-【规则初审结果（audit）】
-${JSON.stringify(audit, null, 2)}
-`.trim();
-    } else {
-      system = system_legacy;
-      user = `
+    const userLegacy = `
 【材料文本】
 ${text}
 
 【复核项（你需要判断）】
 ${JSON.stringify(review, null, 2)}
 `.trim();
-    }
 
-    // ===== Call DeepSeek =====
-    const resp = await fetch("https://api.deepseek.com/chat/completions", {
+    const respLegacy = await fetch("https://api.deepseek.com/chat/completions", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -145,90 +235,26 @@ ${JSON.stringify(review, null, 2)}
       body: JSON.stringify({
         model: "deepseek-chat",
         messages: [
-          { role: "system", content: system },
-          { role: "user", content: user }
+          { role: "system", content: system_legacy },
+          { role: "user", content: userLegacy }
         ],
         temperature: 0.1,
         response_format: { type: "json_object" }
       })
     });
 
-    const raw = await resp.text();
-    if (!resp.ok) {
-      return res.status(resp.status).json({ error: "DeepSeek API error", http_status: resp.status, raw });
+    const rawLegacy = await respLegacy.text();
+    if (!respLegacy.ok) {
+      return res.status(respLegacy.status).json({ error: "DeepSeek API error", http_status: respLegacy.status, raw: rawLegacy });
     }
 
-    let data;
-    try {
-      data = JSON.parse(raw);
-    } catch {
-      return res.status(500).json({ error: "DeepSeek returned non-JSON", raw });
-    }
+    const dataLegacy = JSON.parse(rawLegacy);
+    const contentLegacy = dataLegacy?.choices?.[0]?.message?.content || "{}";
+    const parsedLegacy = JSON.parse(contentLegacy);
 
-    const content = data?.choices?.[0]?.message?.content || "";
-    let parsed;
-    try {
-      parsed = JSON.parse(content);
-    } catch {
-      return res.status(500).json({ error: "Model content is not JSON", content });
-    }
-
-    // ===== 兜底字段 + 强兜底生成整改清单 =====
-    if (!parsed || typeof parsed !== "object") parsed = {};
-
-    if (mode === "report") {
-      parsed.ok = true;
-
-      if (!Array.isArray(parsed.ai_extra)) parsed.ai_extra = [];
-
-      if (!parsed.final_summary || typeof parsed.final_summary !== "object") {
-        parsed.final_summary = { overall: "", top_risks: [], next_actions: [] };
-      }
-      if (typeof parsed.final_summary.overall !== "string") parsed.final_summary.overall = "";
-      if (!Array.isArray(parsed.final_summary.top_risks)) parsed.final_summary.top_risks = [];
-      if (!Array.isArray(parsed.final_summary.next_actions)) parsed.final_summary.next_actions = [];
-
-      const issues = audit && Array.isArray(audit.issues) ? audit.issues : [];
-
-      const oneFix = (it) => ({
-        rule_id: it.rule_id,
-        page: it.page === undefined ? null : it.page,
-        quote: it.quote ? [String(it.quote).slice(0, 80)] : [],
-        problem: it.problem || it.reason || it.message || "",
-        rewrite: [
-          {
-            action: "修改/补充",
-            before: it.quote || "",
-            after: it.suggestion || ""
-          }
-        ],
-        note: ""
-      });
-
-      // 如果 AI 没给或给空，直接用 issues 生成
-      if (!Array.isArray(parsed.rules_issues_fix) || parsed.rules_issues_fix.length === 0) {
-        parsed.rules_issues_fix = issues.map(oneFix);
-      }
-
-      // 补齐缺失：确保每条 issue 都有一条 fix
-      const existed = new Set(
-        parsed.rules_issues_fix.map((x) => `${x?.rule_id || ""}__${x?.page === undefined ? "" : x.page}`)
-      );
-
-      for (const it of issues) {
-        const key = `${it.rule_id || ""}__${it.page === undefined ? "" : it.page}`;
-        if (!existed.has(key)) {
-          parsed.rules_issues_fix.push(oneFix(it));
-          existed.add(key);
-        }
-      }
-
-      return res.status(200).json(parsed);
-    } else {
-      if (!Array.isArray(parsed.ai)) parsed.ai = [];
-      // 保持兼容：legacy 透传模型返回字段，同时确保 ok=true
-      return res.status(200).json({ ok: true, ...parsed });
-    }
+    if (!parsedLegacy || typeof parsedLegacy !== "object") return res.status(200).json({ ok: true, ai: [] });
+    if (!Array.isArray(parsedLegacy.ai)) parsedLegacy.ai = [];
+    return res.status(200).json({ ok: true, ...parsedLegacy });
   } catch (e) {
     return res.status(500).json({ error: String(e), stack: e?.stack });
   }
