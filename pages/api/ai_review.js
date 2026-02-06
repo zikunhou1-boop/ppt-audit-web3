@@ -112,7 +112,12 @@ export default async function handler(req, res) {
 - 不要输出 audit 中不存在的 rule_id 到 rules_issues_fix。
 - quote 最多 3 条，每条 <=80字。
 - rewrite 至少 1 条、最多 3 条，每条必须给 after。
-`.trim();
+强制要求（非常重要）：
+- rules_issues_fix 必须逐条对应 audit.issues，数量不得少于 audit.issues.length。
+- 每条 rules_issues_fix 必须给 quote（来自 pagesText 原文），不得为空、不得写“缺失/无”。
+- rewrite[0].before 必须是 quote 中的一句（或其精简），不得为空、不得写“缺失/无”。
+- rewrite[0].after 必须是可直接替换进课件的具体句子（完整可粘贴），不得只写原则/口径。
+- 如果原文没有对应句子，也要在 quote 写“原文未出现明确句子：……（说明位置）”，并给出建议补充的 after 文案。`.trim();
 
       const user = `
 【全文（按页）】
