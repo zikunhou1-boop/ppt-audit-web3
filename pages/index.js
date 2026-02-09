@@ -4,8 +4,6 @@ import { useState } from "react";
 export default function Home() {
   const [file, setFile] = useState(null);
   const [loading, setLoading] = useState(false);
-
-  // 图片 OCR 进度
   const [ocrProgress, setOcrProgress] = useState(null);
 
   // 最终结果：extract + audit + aiReport
@@ -69,7 +67,7 @@ export default function Home() {
     return null;
   }
 
-  // ===== 图片 OCR（Vercel + 局域网通用：本地依赖优先，CDN 兜底）=====
+  // ===== 图片 OCR：纯 CDN 方案（Vercel/局域网都可用，不需要 npm install）=====
   function isImageFile(f) {
     if (!f) return false;
     const name = (f.name || "").toLowerCase();
@@ -82,23 +80,10 @@ export default function Home() {
     );
   }
 
-  async function loadTesseract() {
+  async function loadTesseractFromCDN() {
     if (typeof window === "undefined") return null;
     if (window.Tesseract) return window.Tesseract;
 
-    // 1) 局域网/本地：优先尝试本地依赖（你以后本地 npm install 后会更稳）
-    try {
-      const mod = await import("tesseract.js");
-      const T = mod?.default || mod;
-      if (T) {
-        window.Tesseract = T;
-        return T;
-      }
-    } catch {
-      // ignore，走 CDN
-    }
-
-    // 2) Vercel / 无安装：CDN 兜底
     await new Promise((resolve, reject) => {
       const s = document.createElement("script");
       s.src = "https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js";
@@ -113,7 +98,7 @@ export default function Home() {
 
   async function ocrImageToText(imgFile) {
     setOcrProgress(0);
-    const Tesseract = await loadTesseract();
+    const Tesseract = await loadTesseractFromCDN();
     if (!Tesseract) throw new Error("Tesseract load failed");
 
     const { data } = await Tesseract.recognize(imgFile, "chi_sim+eng", {
@@ -133,6 +118,7 @@ export default function Home() {
       alert("请先选择文件（ppt/pptx/docx/txt 或 图片 png/jpg）");
       return;
     }
+
     setLoading(true);
     setResult(null);
 
@@ -216,6 +202,7 @@ export default function Home() {
         return;
       }
 
+      // Rules Audit
       const r2 = await fetch("/api/audit", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -228,10 +215,12 @@ export default function Home() {
         return;
       }
 
+      // AI Review
       const pagesText = (extract.pages || [])
         .map((p) => `【第${p.page || ""}页】\n${p.content || ""}`)
         .join("\n\n");
 
+      // 从后端接口取 rulesJson
       let rulesJson = "";
       let rulesOk = false;
       try {
@@ -281,7 +270,6 @@ export default function Home() {
   const riskLevel = result?.audit?.risk_level || "unknown";
   const ai = result?.aiReport;
 
-  // 只在 AI 真生效时展示整改清单
   const fixesToShow = result?.aiUsed && Array.isArray(ai?.rules_issues_fix) ? ai.rules_issues_fix : [];
 
   return (
@@ -334,71 +322,21 @@ export default function Home() {
               规则库读取：{result.rulesOk ? "正常" : "异常（/api/rules 可能没返回 rulesJson）"}
             </div>
 
-            {/* 未生效时直接展示原因 */}
             {!result.aiUsed && result.aiRaw && (
-              <div
-                style={{
-                  border: "1px solid #eee",
-                  background: "#fafafa",
-                  borderRadius: 10,
-                  padding: 10,
-                  marginBottom: 12
-                }}
-              >
+              <div style={{ border: "1px solid #eee", background: "#fafafa", borderRadius: 10, padding: 10, marginBottom: 12 }}>
                 <div style={{ fontWeight: 700, marginBottom: 6 }}>AI 未生效原因（/api/ai_review 返回）</div>
-
                 <div style={{ whiteSpace: "pre-wrap", fontSize: 13, color: "#444" }}>
                   {result.aiRaw.error || result.aiRaw.detail || "（无 error/detail 字段）"}
                 </div>
-
-                {result.aiRaw.http_status ? (
-                  <div style={{ marginTop: 6, fontSize: 13, color: "#666" }}>DeepSeek http_status：{result.aiRaw.http_status}</div>
-                ) : null}
-
-                {result.aiRaw.raw ? (
-                  <div style={{ marginTop: 6, fontSize: 12, color: "#666", whiteSpace: "pre-wrap" }}>
-                    raw: {String(result.aiRaw.raw).slice(0, 800)}
-                  </div>
-                ) : null}
-
-                {result.aiRaw.content_preview ? (
-                  <div style={{ marginTop: 6, fontSize: 12, color: "#666", whiteSpace: "pre-wrap" }}>
-                    content_preview: {String(result.aiRaw.content_preview).slice(0, 800)}
-                  </div>
-                ) : null}
               </div>
             )}
 
-            {/* 只有 AI 生效才展示融合报告 */}
             {result.aiUsed && ai?.final_summary ? (
               <div style={{ border: "1px solid #eee", borderRadius: 10, padding: 12, marginBottom: 12 }}>
                 <div style={{ fontWeight: 700, marginBottom: 6 }}>融合报告（AI 在规则基础上给可落地改写）</div>
-
                 <div style={{ marginBottom: 8 }}>
                   <div style={{ color: "#666", fontSize: 13, marginBottom: 4 }}>总体结论</div>
                   <div style={{ whiteSpace: "pre-wrap" }}>{ai.final_summary.overall || "（无）"}</div>
-                </div>
-
-                <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
-                  <div style={{ flex: "1 1 260px" }}>
-                    <div style={{ color: "#666", fontSize: 13, marginBottom: 4 }}>关键风险（最多3条）</div>
-                    <ul style={{ margin: 0, paddingLeft: 18 }}>
-                      {(ai.final_summary.top_risks || []).slice(0, 3).map((x, i) => (
-                        <li key={i}>{x}</li>
-                      ))}
-                      {(!ai.final_summary.top_risks || ai.final_summary.top_risks.length === 0) && <li>（无）</li>}
-                    </ul>
-                  </div>
-
-                  <div style={{ flex: "1 1 260px" }}>
-                    <div style={{ color: "#666", fontSize: 13, marginBottom: 4 }}>下一步建议（最多3条）</div>
-                    <ul style={{ margin: 0, paddingLeft: 18 }}>
-                      {(ai.final_summary.next_actions || []).slice(0, 3).map((x, i) => (
-                        <li key={i}>{x}</li>
-                      ))}
-                      {(!ai.final_summary.next_actions || ai.final_summary.next_actions.length === 0) && <li>（无）</li>}
-                    </ul>
-                  </div>
                 </div>
               </div>
             ) : null}
@@ -438,20 +376,13 @@ export default function Home() {
                       <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
                         {(it.rewrite || []).slice(0, 3).map((rw, i) => (
                           <div key={i} style={{ background: "#f7f7f7", borderRadius: 8, padding: 10 }}>
-                            <div style={{ fontSize: 13, color: "#666", marginBottom: 4 }}>
-                              动作：{rw.action || "（无）"}
-                            </div>
+                            <div style={{ fontSize: 13, color: "#666", marginBottom: 4 }}>动作：{rw.action || "（无）"}</div>
                             <div style={{ fontSize: 13, color: "#666" }}>before：</div>
                             <div style={{ whiteSpace: "pre-wrap", marginBottom: 6 }}>{rw.before || "（无）"}</div>
                             <div style={{ fontSize: 13, color: "#666" }}>after：</div>
                             <div style={{ whiteSpace: "pre-wrap", fontWeight: 600 }}>{rw.after || "（无）"}</div>
                           </div>
                         ))}
-                        {(!it.rewrite || it.rewrite.length === 0) && (
-                          <div style={{ background: "#f7f7f7", borderRadius: 8, padding: 10, color: "#666" }}>
-                            （AI 未返回改写建议）
-                          </div>
-                        )}
                       </div>
                     </div>
 
@@ -466,7 +397,7 @@ export default function Home() {
               </div>
             ) : (
               <div style={{ color: "#666" }}>
-                {result.aiUsed ? "（AI 未返回可用整改清单）" : "（AI 未生效：请先看上方“AI 未生效原因”并修后端）"}
+                {result.aiUsed ? "（AI 未返回可用整改清单）" : "（AI 未生效：请先看上方原因并修后端）"}
               </div>
             )}
 
@@ -488,4 +419,3 @@ export default function Home() {
     </div>
   );
 }
-
