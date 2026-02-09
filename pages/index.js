@@ -445,7 +445,7 @@ export default function Home() {
         <div style={styles.headerRow}>
           <div>
             <div style={styles.h1}>{title}</div>
-            <div style={styles.sub}>规则检测 + AI 复核 + 图片 OCR（浏览器本地）</div>
+            <div style={styles.sub}>规则检测 + AI 复核 + 图片 OCR </div>
           </div>
         </div>
 
@@ -464,7 +464,7 @@ export default function Home() {
                 checked={enableOCR}
                 onChange={(e) => setEnableOCR(e.target.checked)}
               />
-              <span style={{ marginLeft: 8 }}>启用图片 OCR（慢）</span>
+              <span style={{ marginLeft: 8 }}>启用图片 OCR </span>
             </label>
 
             <button onClick={onRun} disabled={loading} style={styles.btn}>
