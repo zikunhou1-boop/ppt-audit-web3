@@ -405,19 +405,3 @@ ${JSON.stringify(review, null, 2)}
     return res.status(200).json({ ok: false, error: String(e), stack: e?.stack });
   }
 }
-你现在要怎么用（最少改动）
-先把上面这个文件完整替换你现在的 pages/api/ai_review.js（原样覆盖）
-
-前端要调用语义扫描时，发：
-
-await fetch("/api/ai_review", {
-  method: "POST",
-  headers: { "Content-Type": "application/json" },
-  body: JSON.stringify({
-    mode: "semantic",
-    pagesText,      // 你已有
-    audit,          // 可选但建议传
-    rulesJson,      // 可选
-    ocrText: ""     // 先空，后面接 OCR 再传
-  })
-});
