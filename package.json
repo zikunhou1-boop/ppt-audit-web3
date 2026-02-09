@@ -13,5 +13,6 @@
   "jszip": "3.10.1",
   "mammoth": "1.6.0",
   "formidable": "3.5.2"
+  "tesseract.js": "^5.1.0"
 }
 }
