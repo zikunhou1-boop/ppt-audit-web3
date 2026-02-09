@@ -1,13 +1,18 @@
 // pages/index.js
-import { useState } from "react";
+import { useMemo, useState } from "react";
 
 export default function Home() {
   const [file, setFile] = useState(null);
   const [loading, setLoading] = useState(false);
 
-  // 最终结果：extract + audit + aiReport + semantic
+  // OCR 开关
+  const [enableOCR, setEnableOCR] = useState(true);
+  const [ocrStatus, setOcrStatus] = useState({ ok: false, msg: "未加载", progress: 0 });
+
+  // 最终结果：pages + audit + aiReport + semantic
   const [result, setResult] = useState(null);
 
+  // ---------- util ----------
   async function safeJson(resp) {
     const raw = await resp.text();
     try {
@@ -17,94 +22,297 @@ export default function Home() {
     }
   }
 
-  // ✅ 判定“AI 是否生效”：ok:true 且 rules_issues_fix 非空
-  function isReportEffective(aiReportRaw) {
+  function extOf(name) {
+    const m = String(name || "").toLowerCase().match(/\.([a-z0-9]+)$/);
+    return m ? m[1] : "";
+  }
+
+  function stripXmlText(xmlStr) {
+    // 从 slide.xml 提取 <a:t> 文本
+    if (!xmlStr) return "";
+    const hits = [];
+    const re = /<a:t[^>]*>([\s\S]*?)<\/a:t>/g;
+    let m;
+    while ((m = re.exec(xmlStr))) {
+      const t = (m[1] || "")
+        .replace(/&amp;/g, "&")
+        .replace(/&lt;/g, "<")
+        .replace(/&gt;/g, ">")
+        .replace(/&quot;/g, '"')
+        .replace(/&#39;/g, "'")
+        .replace(/<[^>]+>/g, "")
+        .trim();
+      if (t) hits.push(t);
+    }
+    // 简单合并：同一行/段落
+    return hits.join(" ");
+  }
+
+  function sortSlideFiles(files) {
+    // ppt/slides/slide1.xml ... slideN.xml
+    const arr = files.slice();
+    arr.sort((a, b) => {
+      const na = Number((a.match(/slide(\d+)\.xml$/) || [])[1] || 0);
+      const nb = Number((b.match(/slide(\d+)\.xml$/) || [])[1] || 0);
+      return na - nb;
+    });
+    return arr;
+  }
+
+  async function loadScriptAny(urls) {
+    // 动态加载 CDN 脚本（不需要 npm install）
+    for (const url of urls) {
+      try {
+        await new Promise((resolve, reject) => {
+          const s = document.createElement("script");
+          s.src = url;
+          s.async = true;
+          s.onload = () => resolve();
+          s.onerror = () => reject(new Error("load failed: " + url));
+          document.head.appendChild(s);
+        });
+        return { ok: true, url };
+      } catch {
+        // try next
+      }
+    }
+    return { ok: false };
+  }
+
+  async function ensureJSZip() {
+    if (window.JSZip) return true;
+    const r = await loadScriptAny([
+      "https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js",
+      "https://unpkg.com/jszip@3.10.1/dist/jszip.min.js",
+    ]);
+    return !!r.ok && !!window.JSZip;
+  }
+
+  async function ensureTesseract() {
+    if (window.Tesseract) return true;
+    setOcrStatus({ ok: false, msg: "加载 OCR 引擎中...", progress: 0 });
+    const r = await loadScriptAny([
+      "https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js",
+      "https://unpkg.com/tesseract.js@5/dist/tesseract.min.js",
+    ]);
+    const ok = !!r.ok && !!window.Tesseract;
+    setOcrStatus({ ok, msg: ok ? "OCR 引擎已就绪" : "OCR 引擎加载失败（CDN 不可达）", progress: 0 });
+    return ok;
+  }
+
+  function dedupeIssues(list) {
+    // 规则/AI 输出去重：rule_id + page + quote0
+    const out = [];
+    const seen = new Set();
+    for (const it of list || []) {
+      const q0 = Array.isArray(it?.quote) && it.quote[0] ? String(it.quote[0]) : "";
+      const key = `${it?.rule_id || ""}__${it?.page ?? ""}__${q0.slice(0, 80)}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(it);
+    }
+    return out;
+  }
+
+  // 判定“AI 是否生效”
+  function isAiReportEffective(aiReportRaw) {
     if (!aiReportRaw || typeof aiReportRaw !== "object") return false;
     if (aiReportRaw.ok !== true) return false;
     if (!Array.isArray(aiReportRaw.rules_issues_fix) || aiReportRaw.rules_issues_fix.length === 0) return false;
     return true;
   }
 
-  // ✅ 规范化成 report 结构（只做展示转换，不做“兜底伪装成AI”）
   function normalizeAiReport(aiReportRaw) {
     if (!aiReportRaw || typeof aiReportRaw !== "object") return null;
 
-    // 已是 report 结构
     if (aiReportRaw?.final_summary && Array.isArray(aiReportRaw?.rules_issues_fix)) {
       return {
         ok: aiReportRaw.ok === true,
         final_summary: aiReportRaw.final_summary,
-        rules_issues_fix: aiReportRaw.rules_issues_fix,
-        ai_extra: Array.isArray(aiReportRaw.ai_extra) ? aiReportRaw.ai_extra : []
+        rules_issues_fix: dedupeIssues(aiReportRaw.rules_issues_fix),
+        ai_extra: Array.isArray(aiReportRaw.ai_extra) ? aiReportRaw.ai_extra : [],
       };
     }
 
-    // 兼容旧结构：{ ai: [...] }（转换成 report 结构展示）
+    // 兼容旧结构：{ ai: [...] }
     const legacy = aiReportRaw?.ai;
     if (Array.isArray(legacy)) {
       return {
         ok: true,
         final_summary: { overall: "", top_risks: [], next_actions: [] },
-        rules_issues_fix: legacy.map((x) => ({
-          rule_id: x.rule_id,
-          page: x.page ?? null,
-          quote: Array.isArray(x.quote) ? x.quote.slice(0, 3) : [],
-          problem: x.problem || "",
-          rewrite: Array.isArray(x.rewrite_suggestion)
-            ? x.rewrite_suggestion.slice(0, 3).map((r) => ({
-                action: r.action || "修改/补充",
-                before: r.before || "",
-                after: r.after || ""
-              }))
-            : [],
-          note: x.notes || ""
-        })),
-        ai_extra: []
+        rules_issues_fix: dedupeIssues(
+          legacy.map((x) => ({
+            rule_id: x.rule_id,
+            page: x.page ?? null,
+            quote: Array.isArray(x.quote) ? x.quote.slice(0, 3) : [],
+            problem: x.problem || "",
+            rewrite: Array.isArray(x.rewrite_suggestion)
+              ? x.rewrite_suggestion.slice(0, 3).map((r) => ({
+                  action: r.action || "修改/补充",
+                  before: r.before || "",
+                  after: r.after || "",
+                }))
+              : [],
+            note: x.notes || "",
+          }))
+        ),
+        ai_extra: [],
       };
     }
 
     return null;
   }
 
-  // ✅ 语义扫描是否有效：ok:true 且 ai_extra 是数组（可空也算有效）
-  function isSemanticEffective(semanticRaw) {
-    if (!semanticRaw || typeof semanticRaw !== "object") return false;
-    if (semanticRaw.ok !== true) return false;
-    if (!Array.isArray(semanticRaw.ai_extra)) return false;
-    return true;
+  // ---------- PPTX: browser extract ----------
+  async function extractFromPptxBrowser(pptxFile, doOCR) {
+    const okZip = await ensureJSZip();
+    if (!okZip) {
+      return { ok: false, error: "JSZip 加载失败（网络/CDN不可达）" };
+    }
+
+    const buf = await pptxFile.arrayBuffer();
+    const zip = await window.JSZip.loadAsync(buf);
+
+    // slides
+    const slideFiles = [];
+    zip.forEach((relativePath) => {
+      if (/^ppt\/slides\/slide\d+\.xml$/i.test(relativePath)) slideFiles.push(relativePath);
+    });
+
+    const slides = [];
+    for (const f of sortSlideFiles(slideFiles)) {
+      const xml = await zip.file(f).async("string");
+      slides.push(stripXmlText(xml));
+    }
+
+    const pages = slides.map((t, idx) => ({ page: idx + 1, content: t || "" }));
+
+    // images
+    let ocrText = "";
+    if (doOCR) {
+      const okOcr = await ensureTesseract();
+      if (!okOcr) {
+        return { ok: true, pages, ocrText: "", ocrOk: false, ocrError: "OCR 引擎加载失败（CDN不可达）" };
+      }
+
+      // 收集图片：ppt/media/*
+      const mediaFiles = [];
+      zip.forEach((relativePath) => {
+        if (/^ppt\/media\/.+\.(png|jpg|jpeg)$/i.test(relativePath)) mediaFiles.push(relativePath);
+      });
+
+      // 按文件大小排序，优先识别“大图”（更可能是截图/正文图）
+      const mediaWithSize = [];
+      for (const f of mediaFiles) {
+        const fileObj = zip.file(f);
+        if (!fileObj) continue;
+        const ab = await fileObj.async("arraybuffer");
+        mediaWithSize.push({ path: f, size: ab.byteLength, ab });
+      }
+      mediaWithSize.sort((a, b) => b.size - a.size);
+
+      // 分批：每批 30 张，全部跑（你说放开）
+      const batchSize = 30;
+      const total = mediaWithSize.length;
+
+      let allTexts = [];
+      for (let i = 0; i < total; i += batchSize) {
+        const batch = mediaWithSize.slice(i, i + batchSize);
+
+        for (let j = 0; j < batch.length; j++) {
+          const idxGlobal = i + j + 1;
+          const item = batch[j];
+
+          setOcrStatus((s) => ({
+            ok: true,
+            msg: `OCR 识别中：${idxGlobal}/${total}`,
+            progress: total ? Math.round((idxGlobal / total) * 100) : 0,
+          }));
+
+          try {
+            const blob = new Blob([item.ab], { type: "image/" + (item.path.toLowerCase().endsWith(".png") ? "png" : "jpeg") });
+            const url = URL.createObjectURL(blob);
+
+            // eslint-disable-next-line no-undef
+            const r = await window.Tesseract.recognize(url, "chi_sim+eng", {
+              logger: () => {},
+            });
+
+            URL.revokeObjectURL(url);
+
+            const txt = (r?.data?.text || "").trim();
+            if (txt && txt.length >= 6) {
+              allTexts.push(`【图片OCR#${idxGlobal} ${item.path.split("/").pop()}】\n${txt}`);
+            }
+          } catch {
+            // 忽略单张失败
+          }
+        }
+      }
+
+      setOcrStatus({ ok: true, msg: total ? `OCR 完成：${total} 张` : "OCR：无图片", progress: 100 });
+      ocrText = allTexts.join("\n\n");
+    }
+
+    return { ok: true, pages, ocrText, ocrOk: true };
   }
 
+  // ---------- run ----------
   async function onRun() {
     if (!file) {
-      alert("请先选择文件（ppt/pptx/docx/txt）");
+      alert("请先选择文件（推荐 PPTX）");
       return;
     }
+
     setLoading(true);
     setResult(null);
+    setOcrStatus((s) => ({ ...s, progress: 0 }));
 
     try {
-      // 1) Extract
-      const fd = new FormData();
-      fd.append("file", file);
+      const ext = extOf(file.name);
 
-      const r1 = await fetch("/api/extract", { method: "POST", body: fd });
-      const extract = await safeJson(r1);
+      let pages = [];
+      let ocrText = "";
 
-     if (!extract.ok || !Array.isArray(extract.pages) || extract.pages.length === 0) {
-  setResult({
-    stage: "error",
-    message: `提取失败：未获取到页面内容（/api/extract 返回 ${r1.status}）`,
-    detail: extract
-  });
-  return;
-}
+      if (ext === "pptx") {
+        const r = await extractFromPptxBrowser(file, !!enableOCR);
+        if (!r.ok) {
+          setResult({ stage: "error", message: "提取失败", detail: r });
+          return;
+        }
+        pages = r.pages || [];
+        ocrText = r.ocrText || "";
+      } else if (ext === "txt") {
+        const txt = await file.text();
+        pages = [{ page: 1, content: txt }];
+      } else if (ext === "docx" || ext === "ppt") {
+        setResult({
+          stage: "error",
+          message: "当前版本不支持在浏览器里解析 DOCX/PPT。请先另存为 PPTX 再上传。",
+        });
+        return;
+      } else {
+        setResult({ stage: "error", message: "不支持的文件类型（请用 .pptx/.txt）" });
+        return;
+      }
 
+      if (!Array.isArray(pages) || pages.length === 0) {
+        setResult({ stage: "error", message: "提取失败：未获取到页面内容（PPTX 可能无文本层）" });
+        return;
+      }
 
-      // 2) Rules Audit
+      // 合并全文（含 OCR）
+      const pagesText = pages
+        .map((p) => `【第${p.page}页】\n${p.content || ""}`)
+        .join("\n\n");
+
+      const fullText = ocrText ? `${pagesText}\n\n【图片OCR文本】\n${ocrText}` : pagesText;
+
+      // 1) Rules Audit（必用 rules/rules.json）
       const r2 = await fetch("/api/audit", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ pages: extract.pages })
+        body: JSON.stringify({ pages }),
       });
       const audit = await safeJson(r2);
 
@@ -113,12 +321,7 @@ export default function Home() {
         return;
       }
 
-      // 3) 拼全文
-      const pagesText = (extract.pages || [])
-        .map((p) => `【第${p.page || ""}页】\n${p.content || ""}`)
-        .join("\n\n");
-
-      // 4) 取 rulesJson（从后端接口取）
+      // 2) 取 rulesJson（给 AI 用）
       let rulesJson = "";
       let rulesOk = false;
       try {
@@ -131,54 +334,96 @@ export default function Home() {
         rulesOk = false;
       }
 
-      // 5) AI report（整改清单）
+      // 3) AI report（融合整改）
       const r3 = await fetch("/api/ai_review", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           mode: "report",
-          pagesText,
+          pagesText: fullText,
           audit,
-          rulesJson
-        })
+          rulesJson,
+        }),
       });
+
       const aiReportRaw = await safeJson(r3);
       const aiReport = normalizeAiReport(aiReportRaw);
-      const aiUsed = isReportEffective(aiReportRaw);
+      const aiUsed = isAiReportEffective(aiReportRaw);
 
-      // 6) AI semantic（全篇语义扫描）
+      // 4) AI semantic（全篇语义扫描：只要 high 必改）
       const r4 = await fetch("/api/ai_review", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           mode: "semantic",
-          pagesText,
+          pagesText: fullText,
           audit,
           rulesJson,
-          ocrText: "" // 先空，OCR 后续接入再传
-        })
+        }),
       });
       const semanticRaw = await safeJson(r4);
-      const semanticUsed = isSemanticEffective(semanticRaw);
-      const semanticExtra = semanticUsed ? semanticRaw.ai_extra : [];
+
+      const semanticHighMust = Array.isArray(semanticRaw?.semantic_extra)
+        ? semanticRaw.semantic_extra.filter((x) => x?.severity === "high" && x?.must_fix === true)
+        : [];
+
+      // 统一成“必须修改问题”清单：report 的 rules_issues_fix + semantic high
+      const mustFix = [];
+
+      if (aiUsed && Array.isArray(aiReport?.rules_issues_fix)) {
+        for (const it of aiReport.rules_issues_fix) {
+          mustFix.push({
+            kind: "rule",
+            rule_id: it.rule_id,
+            page: it.page,
+            quote: it.quote,
+            problem: it.problem,
+            rewrite: it.rewrite,
+            note: it.note,
+          });
+        }
+      }
+
+      for (const x of semanticHighMust) {
+        mustFix.push({
+          kind: "semantic",
+          rule_id: "语义高风险",
+          page: x.page ?? null,
+          quote: Array.isArray(x.quote) ? x.quote : [],
+          problem: `${x.problem || ""}${x.why_high ? `（原因：${x.why_high}）` : ""}`,
+          rewrite: [{ action: "替换/修改", before: (x.quote && x.quote[0]) || "", after: x.fix || "" }],
+          note: "",
+        });
+      }
+
+      // 去重（防止 semantic 与 report 内容撞车）
+      const mustFixDedup = dedupeIssues(
+        mustFix.map((m) => ({
+          rule_id: m.rule_id,
+          page: m.page,
+          quote: m.quote,
+          problem: m.problem,
+          rewrite: m.rewrite,
+          note: m.note,
+        }))
+      ).map((x) => ({
+        kind: x.rule_id === "语义高风险" ? "semantic" : "rule",
+        ...x,
+      }));
 
       setResult({
         stage: "done",
-        extract,
+        pagesCount: pages.length,
+        hasOCRText: !!ocrText,
         audit,
         rulesOk,
-
-        // report
-        aiReport,
         aiUsed,
         aiHttpStatus: r3.status,
         aiRaw: aiReportRaw,
-
-        // semantic
-        semanticUsed,
-        semanticHttpStatus: r4.status,
+        aiReport,
+        semanticOk: semanticRaw?.ok === true,
         semanticRaw,
-        semanticExtra
+        mustFix: mustFixDedup,
       });
     } catch (e) {
       setResult({ stage: "error", message: "客户端异常", detail: String(e?.message || e) });
@@ -187,266 +432,151 @@ export default function Home() {
     }
   }
 
+  // ---------- UI ----------
   const auditPass = result?.audit?.pass === true;
   const riskLevel = result?.audit?.risk_level || "unknown";
-  const ai = result?.aiReport;
-  const fixesToShow = result?.aiUsed && Array.isArray(ai?.rules_issues_fix) ? ai.rules_issues_fix : [];
+  const mustFixList = Array.isArray(result?.mustFix) ? result.mustFix : [];
 
-  // UI：尽量少技术词（你后面要美化可以再改）
+  const title = useMemo(() => "课件合规检查", []);
+
   return (
-    <div style={{ maxWidth: 920, margin: "28px auto", padding: 16, fontFamily: "system-ui, -apple-system" }}>
-      <h2 style={{ margin: "0 0 12px 0" }}>课件合规审核</h2>
-
-      <div style={{ border: "1px solid #e6e6e6", borderRadius: 14, padding: 14, background: "#fff" }}>
-        <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
-          <input
-            type="file"
-            accept=".ppt,.pptx,.docx,.txt"
-            onChange={(e) => setFile(e.target.files?.[0] || null)}
-            style={{ flex: "1 1 320px" }}
-          />
-
-          <button
-            onClick={onRun}
-            disabled={loading}
-            style={{
-              padding: "10px 14px",
-              borderRadius: 10,
-              border: "1px solid #ddd",
-              background: loading ? "#f3f3f3" : "#111",
-              color: loading ? "#666" : "#fff",
-              cursor: loading ? "not-allowed" : "pointer"
-            }}
-          >
-            {loading ? "处理中..." : "开始审核"}
-          </button>
+    <div style={styles.page}>
+      <div style={styles.card}>
+        <div style={styles.headerRow}>
+          <div>
+            <div style={styles.h1}>{title}</div>
+            <div style={styles.sub}>规则检测 + AI 复核 + 图片 OCR（浏览器本地）</div>
+          </div>
         </div>
 
-        <div style={{ marginTop: 10, color: "#777", fontSize: 13 }}>
-          支持：ppt/pptx/docx/txt（OCR 后续接入）
+        <div style={styles.uploader}>
+          <input
+            type="file"
+            accept=".pptx,.txt"
+            onChange={(e) => setFile(e.target.files?.[0] || null)}
+            style={styles.file}
+          />
+
+          <div style={styles.row}>
+            <label style={styles.switchRow}>
+              <input
+                type="checkbox"
+                checked={enableOCR}
+                onChange={(e) => setEnableOCR(e.target.checked)}
+              />
+              <span style={{ marginLeft: 8 }}>启用图片 OCR（慢）</span>
+            </label>
+
+            <button onClick={onRun} disabled={loading} style={styles.btn}>
+              {loading ? "处理中..." : "开始检查"}
+            </button>
+          </div>
+
+          <div style={styles.meta}>
+            推荐：PPTX。DOCX/PPT 请先另存为 PPTX。{enableOCR ? "（OCR 会识别 PPTX 内图片）" : ""}
+          </div>
+
+          {enableOCR && (
+            <div style={styles.ocrBar}>
+              <div style={styles.ocrText}>{ocrStatus.msg}</div>
+              <div style={styles.progressWrap}>
+                <div style={{ ...styles.progress, width: `${ocrStatus.progress || 0}%` }} />
+              </div>
+            </div>
+          )}
         </div>
       </div>
 
-      <div style={{ marginTop: 18 }}>
-        <h3 style={{ margin: "0 0 10px 0" }}>结果</h3>
-
-        {!result && <div style={{ color: "#777" }}>选择文件后点击“开始审核”。</div>}
+      {/* result */}
+      <div style={{ ...styles.card, marginTop: 14 }}>
+        {!result && <div style={styles.empty}>上传 PPTX 后点击“开始检查”。</div>}
 
         {result?.stage === "error" && (
-          <div style={{ border: "1px solid #ffd2d2", background: "#fff5f5", borderRadius: 14, padding: 12 }}>
-            <div style={{ fontWeight: 700, marginBottom: 6 }}>失败</div>
-            <div style={{ whiteSpace: "pre-wrap" }}>{result.message || "（无）"}</div>
+          <div style={styles.errBox}>
+            <div style={styles.errTitle}>失败</div>
+            <div style={styles.pre}>{result.message || "（无）"}</div>
+            {result.detail ? <div style={{ ...styles.pre, opacity: 0.85 }}>{JSON.stringify(result.detail, null, 2)}</div> : null}
           </div>
         )}
 
         {result?.stage === "done" && (
           <>
-            <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginBottom: 10 }}>
-              <div
-                style={{
-                  padding: "8px 10px",
-                  borderRadius: 999,
-                  border: "1px solid #eee",
-                  background: "#fafafa",
-                  fontSize: 13
-                }}
-              >
-                规则结论：<b>{auditPass ? "通过" : "不通过"}</b>（{riskLevel}）
-              </div>
-
-              <div
-                style={{
-                  padding: "8px 10px",
-                  borderRadius: 999,
-                  border: "1px solid #eee",
-                  background: "#fafafa",
-                  fontSize: 13
-                }}
-              >
-                规则库：<b>{result.rulesOk ? "正常" : "异常"}</b>
-              </div>
-
-              <div
-                style={{
-                  padding: "8px 10px",
-                  borderRadius: 999,
-                  border: "1px solid #eee",
-                  background: "#fafafa",
-                  fontSize: 13
-                }}
-              >
-                AI整改：<b>{result.aiUsed ? "已生效" : "未生效"}</b>
-              </div>
-
-              <div
-                style={{
-                  padding: "8px 10px",
-                  borderRadius: 999,
-                  border: "1px solid #eee",
-                  background: "#fafafa",
-                  fontSize: 13
-                }}
-              >
-                AI语义扫描：<b>{result.semanticUsed ? "已生效" : "未生效"}</b>
-              </div>
+            <div style={styles.topLine}>
+              <span style={styles.badge}>{auditPass ? "规则：通过" : "规则：不通过"}</span>
+              <span style={{ ...styles.badge, opacity: 0.8 }}>风险：{riskLevel}</span>
+              <span style={{ ...styles.badge, opacity: 0.8 }}>
+                页数：{result.pagesCount || 0}{result.hasOCRText ? "（含OCR）" : ""}
+              </span>
             </div>
 
-            {/* AI 未生效原因（report） */}
-            {!result.aiUsed && result.aiRaw && (
-              <div style={{ border: "1px solid #eee", background: "#fafafa", borderRadius: 14, padding: 10, marginBottom: 12 }}>
-                <div style={{ fontWeight: 700, marginBottom: 6 }}>AI整改未生效原因</div>
-                <div style={{ whiteSpace: "pre-wrap", fontSize: 13, color: "#444" }}>
-                  {result.aiRaw.error || result.aiRaw.detail || "（无 error/detail 字段）"}
-                </div>
-                {result.aiRaw.http_status ? (
-                  <div style={{ marginTop: 6, fontSize: 12, color: "#666" }}>DeepSeek http_status：{result.aiRaw.http_status}</div>
-                ) : null}
+            <div style={styles.smallLine}>
+              <span>AI 复核：{result.aiUsed ? "已生效" : `未生效（HTTP ${result.aiHttpStatus}）`}</span>
+              <span style={{ margin: "0 8px", opacity: 0.5 }}>·</span>
+              <span>规则库：{result.rulesOk ? "正常" : "异常"}</span>
+              <span style={{ margin: "0 8px", opacity: 0.5 }}>·</span>
+              <span>语义扫描：{result.semanticOk ? "已运行（仅显示高风险必改）" : "未运行"}</span>
+            </div>
+
+            {/* AI 未生效原因（精简显示） */}
+            {!result.aiUsed && result.aiRaw?.error && (
+              <div style={styles.hintBox}>
+                <div style={styles.hintTitle}>AI 未生效原因</div>
+                <div style={styles.pre}>{result.aiRaw.error || result.aiRaw.detail || "（无）"}</div>
               </div>
             )}
 
-            {/* AI 未生效原因（semantic） */}
-            {!result.semanticUsed && result.semanticRaw && (
-              <div style={{ border: "1px solid #eee", background: "#fafafa", borderRadius: 14, padding: 10, marginBottom: 12 }}>
-                <div style={{ fontWeight: 700, marginBottom: 6 }}>AI语义扫描未生效原因</div>
-                <div style={{ whiteSpace: "pre-wrap", fontSize: 13, color: "#444" }}>
-                  {result.semanticRaw.error || result.semanticRaw.detail || "（无 error/detail 字段）"}
-                </div>
-                {result.semanticRaw.http_status ? (
-                  <div style={{ marginTop: 6, fontSize: 12, color: "#666" }}>DeepSeek http_status：{result.semanticRaw.http_status}</div>
-                ) : null}
-              </div>
-            )}
-
-            {/* 融合报告（report） */}
-            {result.aiUsed && ai?.final_summary ? (
-              <div style={{ border: "1px solid #eee", borderRadius: 14, padding: 12, marginBottom: 12, background: "#fff" }}>
-                <div style={{ fontWeight: 800, marginBottom: 10 }}>融合报告</div>
-
-                <div style={{ marginBottom: 10 }}>
-                  <div style={{ color: "#777", fontSize: 13, marginBottom: 4 }}>总体结论</div>
-                  <div style={{ whiteSpace: "pre-wrap" }}>{ai.final_summary.overall || "（无）"}</div>
-                </div>
-
-                <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
-                  <div style={{ flex: "1 1 260px" }}>
-                    <div style={{ color: "#777", fontSize: 13, marginBottom: 4 }}>关键风险</div>
-                    <ul style={{ margin: 0, paddingLeft: 18 }}>
-                      {(ai.final_summary.top_risks || []).slice(0, 3).map((x, i) => (
-                        <li key={i}>{x}</li>
-                      ))}
-                      {(!ai.final_summary.top_risks || ai.final_summary.top_risks.length === 0) && <li>（无）</li>}
-                    </ul>
-                  </div>
-
-                  <div style={{ flex: "1 1 260px" }}>
-                    <div style={{ color: "#777", fontSize: 13, marginBottom: 4 }}>下一步建议</div>
-                    <ul style={{ margin: 0, paddingLeft: 18 }}>
-                      {(ai.final_summary.next_actions || []).slice(0, 3).map((x, i) => (
-                        <li key={i}>{x}</li>
-                      ))}
-                      {(!ai.final_summary.next_actions || ai.final_summary.next_actions.length === 0) && <li>（无）</li>}
-                    </ul>
-                  </div>
-                </div>
+            {/* summary */}
+            {result.aiUsed && result.aiReport?.final_summary ? (
+              <div style={styles.summaryBox}>
+                <div style={styles.sectionTitle}>摘要</div>
+                <div style={styles.pre}>{result.aiReport.final_summary.overall || "（无）"}</div>
               </div>
             ) : null}
 
-            {/* 可落地整改清单（report） */}
-            <h4 style={{ margin: "12px 0 8px 0" }}>可落地整改清单</h4>
-
-            {fixesToShow.length > 0 ? (
+            {/* MUST FIX */}
+            <div style={styles.sectionTitle}>必须修改的问题（高风险）</div>
+            {mustFixList.length === 0 ? (
+              <div style={styles.empty}>（无）</div>
+            ) : (
               <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-                {fixesToShow.map((it, idx) => (
-                  <div key={idx} style={{ border: "1px solid #eee", borderRadius: 14, padding: 12, background: "#fff" }}>
-                    <div style={{ fontWeight: 800, marginBottom: 8 }}>
-                      #{idx + 1}｜rule_id：{it.rule_id}｜页：{it.page}
+                {mustFixList.map((it, idx) => (
+                  <div key={idx} style={styles.itemCard}>
+                    <div style={styles.itemTitle}>
+                      #{idx + 1} · {it.rule_id} · 第{it.page ?? "?"}页
+                      <span style={styles.tag}>{it.kind === "semantic" ? "语义扫描" : "规则+复核"}</span>
                     </div>
 
-                    {Array.isArray(it.quote) && it.quote.length > 0 && (
-                      <div style={{ marginBottom: 8 }}>
-                        <div style={{ color: "#777", fontSize: 13, marginBottom: 4 }}>定位原文</div>
-                        <ul style={{ margin: 0, paddingLeft: 18 }}>
-                          {it.quote.slice(0, 3).map((q, i) => (
-                            <li key={i} style={{ whiteSpace: "pre-wrap" }}>
-                              {q}
-                            </li>
-                          ))}
-                        </ul>
-                      </div>
-                    )}
-
-                    {it.problem && (
-                      <div style={{ marginBottom: 8 }}>
-                        <div style={{ color: "#777", fontSize: 13, marginBottom: 4 }}>问题说明</div>
-                        <div style={{ whiteSpace: "pre-wrap" }}>{it.problem}</div>
-                      </div>
-                    )}
-
-                    <div>
-                      <div style={{ color: "#777", fontSize: 13, marginBottom: 6 }}>改写建议</div>
-                      <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-                        {(it.rewrite || []).slice(0, 3).map((rw, i) => (
-                          <div key={i} style={{ background: "#f7f7f7", borderRadius: 12, padding: 10 }}>
-                            <div style={{ fontSize: 12, color: "#666", marginBottom: 4 }}>
-                              动作：{rw.action || "（无）"}
-                            </div>
-                            <div style={{ fontSize: 12, color: "#666" }}>before：</div>
-                            <div style={{ whiteSpace: "pre-wrap", marginBottom: 6 }}>{rw.before || "（无）"}</div>
-                            <div style={{ fontSize: 12, color: "#666" }}>after：</div>
-                            <div style={{ whiteSpace: "pre-wrap", fontWeight: 700 }}>{rw.after || "（无）"}</div>
-                          </div>
-                        ))}
-                        {(!it.rewrite || it.rewrite.length === 0) && (
-                          <div style={{ background: "#f7f7f7", borderRadius: 12, padding: 10, color: "#666" }}>
-                            （AI 未返回改写建议）
-                          </div>
-                        )}
-                      </div>
-                    </div>
-
-                    {it.note && (
+                    {Array.isArray(it.quote) && it.quote.length > 0 ? (
                       <div style={{ marginTop: 8 }}>
-                        <div style={{ color: "#777", fontSize: 13, marginBottom: 4 }}>备注</div>
-                        <div style={{ whiteSpace: "pre-wrap" }}>{it.note}</div>
-                      </div>
-                    )}
-                  </div>
-                ))}
-              </div>
-            ) : (
-              <div style={{ color: "#777" }}>{result.aiUsed ? "（AI 未返回可用整改清单）" : "（AI 整改未生效）"}</div>
-            )}
-
-            {/* 全篇语义扫描结果（semantic） */}
-            <h4 style={{ margin: "14px 0 8px 0" }}>AI 语义风险补充（全篇扫描）</h4>
-
-            {result.semanticUsed && Array.isArray(result.semanticExtra) && result.semanticExtra.length > 0 ? (
-              <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-                {result.semanticExtra.slice(0, 20).map((x, i) => (
-                  <div key={i} style={{ border: "1px solid #eee", borderRadius: 14, padding: 12, background: "#fff" }}>
-                    <div style={{ fontWeight: 800, marginBottom: 6 }}>
-                      #{i + 1}｜{x.severity || "medium"}｜页：{x.page ?? "?"}
-                    </div>
-                    {x.problem ? (
-                      <div style={{ marginBottom: 6, whiteSpace: "pre-wrap" }}>{x.problem}</div>
-                    ) : null}
-                    {Array.isArray(x.quote) && x.quote.length > 0 ? (
-                      <div style={{ color: "#666", fontSize: 13, whiteSpace: "pre-wrap", marginBottom: 6 }}>
-                        引用：{x.quote[0]}
+                        <div style={styles.label}>定位原文</div>
+                        <div style={styles.pre}>{it.quote.slice(0, 2).join("\n")}</div>
                       </div>
                     ) : null}
-                    {x.suggestion ? (
-                      <div style={{ background: "#f7f7f7", borderRadius: 12, padding: 10 }}>
-                        <div style={{ fontSize: 12, color: "#666", marginBottom: 4 }}>建议改法：</div>
-                        <div style={{ whiteSpace: "pre-wrap", fontWeight: 700 }}>{x.suggestion}</div>
+
+                    {it.problem ? (
+                      <div style={{ marginTop: 8 }}>
+                        <div style={styles.label}>问题</div>
+                        <div style={styles.pre}>{it.problem}</div>
+                      </div>
+                    ) : null}
+
+                    {Array.isArray(it.rewrite) && it.rewrite.length > 0 ? (
+                      <div style={{ marginTop: 8 }}>
+                        <div style={styles.label}>建议改写</div>
+                        <div style={styles.rewriteBox}>
+                          <div style={styles.rewriteCol}>
+                            <div style={styles.rewriteLabel}>before</div>
+                            <div style={styles.pre}>{it.rewrite[0]?.before || ""}</div>
+                          </div>
+                          <div style={styles.rewriteCol}>
+                            <div style={styles.rewriteLabel}>after</div>
+                            <div style={{ ...styles.pre, fontWeight: 700 }}>{it.rewrite[0]?.after || ""}</div>
+                          </div>
+                        </div>
                       </div>
                     ) : null}
                   </div>
                 ))}
-              </div>
-            ) : (
-              <div style={{ color: "#777" }}>
-                {result.semanticUsed ? "（未发现额外语义风险）" : "（语义扫描未生效）"}
               </div>
             )}
           </>
@@ -455,3 +585,69 @@ export default function Home() {
     </div>
   );
 }
+
+// ---------- minimal UI ----------
+const styles = {
+  page: {
+    maxWidth: 980,
+    margin: "24px auto",
+    padding: 16,
+    fontFamily: 'system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial',
+    color: "#111",
+  },
+  card: {
+    border: "1px solid #eee",
+    borderRadius: 16,
+    padding: 16,
+    background: "#fff",
+    boxShadow: "0 8px 30px rgba(0,0,0,0.04)",
+  },
+  headerRow: { display: "flex", justifyContent: "space-between", alignItems: "flex-start" },
+  h1: { fontSize: 20, fontWeight: 800, letterSpacing: 0.2 },
+  sub: { marginTop: 6, fontSize: 13, color: "#666" },
+
+  uploader: { marginTop: 12 },
+  file: { width: "100%" },
+  row: { display: "flex", gap: 12, alignItems: "center", marginTop: 12 },
+  switchRow: { display: "flex", alignItems: "center", fontSize: 13, color: "#333" },
+  btn: {
+    marginLeft: "auto",
+    padding: "10px 14px",
+    borderRadius: 12,
+    border: "1px solid #ddd",
+    background: "#111",
+    color: "#fff",
+    cursor: "pointer",
+  },
+  meta: { marginTop: 10, fontSize: 12, color: "#777" },
+
+  ocrBar: { marginTop: 10, padding: 10, borderRadius: 12, background: "#fafafa", border: "1px solid #eee" },
+  ocrText: { fontSize: 12, color: "#555" },
+  progressWrap: { height: 8, background: "#eee", borderRadius: 999, marginTop: 8, overflow: "hidden" },
+  progress: { height: 8, background: "#111" },
+
+  empty: { color: "#777", fontSize: 13 },
+
+  errBox: { border: "1px solid #f3caca", background: "#fff5f5", borderRadius: 14, padding: 12 },
+  errTitle: { fontWeight: 800, marginBottom: 6 },
+  pre: { whiteSpace: "pre-wrap", fontSize: 13, lineHeight: 1.5 },
+
+  topLine: { display: "flex", gap: 8, alignItems: "center", marginBottom: 10 },
+  badge: { fontSize: 12, padding: "6px 10px", borderRadius: 999, border: "1px solid #eee", background: "#fafafa" },
+  smallLine: { fontSize: 12, color: "#666", marginBottom: 12 },
+
+  hintBox: { padding: 12, borderRadius: 14, border: "1px solid #eee", background: "#fafafa", marginBottom: 12 },
+  hintTitle: { fontWeight: 800, marginBottom: 6 },
+
+  summaryBox: { padding: 12, borderRadius: 14, border: "1px solid #eee", background: "#fff", marginBottom: 12 },
+  sectionTitle: { fontWeight: 900, margin: "12px 0 10px", fontSize: 14 },
+
+  itemCard: { border: "1px solid #eee", borderRadius: 14, padding: 12, background: "#fff" },
+  itemTitle: { fontWeight: 900, fontSize: 13, display: "flex", gap: 8, alignItems: "center" },
+  tag: { marginLeft: "auto", fontSize: 12, color: "#666", border: "1px solid #eee", padding: "4px 8px", borderRadius: 999, background: "#fafafa" },
+  label: { fontSize: 12, color: "#666", marginBottom: 6 },
+
+  rewriteBox: { display: "flex", gap: 10, flexWrap: "wrap" },
+  rewriteCol: { flex: "1 1 360px", border: "1px solid #eee", borderRadius: 12, padding: 10, background: "#fafafa" },
+  rewriteLabel: { fontSize: 12, color: "#666", marginBottom: 6 },
+};
