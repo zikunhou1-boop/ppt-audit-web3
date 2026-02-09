@@ -90,10 +90,15 @@ export default function Home() {
       const r1 = await fetch("/api/extract", { method: "POST", body: fd });
       const extract = await safeJson(r1);
 
-      if (!extract.ok || !Array.isArray(extract.pages) || extract.pages.length === 0) {
-        setResult({ stage: "error", message: "提取失败：未获取到页面内容", detail: extract });
-        return;
-      }
+     if (!extract.ok || !Array.isArray(extract.pages) || extract.pages.length === 0) {
+  setResult({
+    stage: "error",
+    message: `提取失败：未获取到页面内容（/api/extract 返回 ${r1.status}）`,
+    detail: extract
+  });
+  return;
+}
+
 
       // 2) Rules Audit
       const r2 = await fetch("/api/audit", {
