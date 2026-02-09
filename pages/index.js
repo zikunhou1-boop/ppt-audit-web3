@@ -1,19 +1,26 @@
 // pages/index.js
-import { useEffect, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 import Script from "next/script";
 
 export default function Home() {
   const [file, setFile] = useState(null);
   const [loading, setLoading] = useState(false);
 
-  // OCR 开关 & 进度
+  // libs ready (CDN)
+  const [zipReady, setZipReady] = useState(false);
+  const [ocrReady, setOcrReady] = useState(false);
+
+  // options
   const [enableOcr, setEnableOcr] = useState(true);
-  const [ocrStatus, setOcrStatus] = useState({ stage: "idle", done: 0, total: 0, msg: "" });
+  const [batchSize, setBatchSize] = useState(30); // 每批图片数量
+  const [maxImages, setMaxImages] = useState(120); // 最大处理图片数量（防止卡死）
+  const [onlyLikelyText, setOnlyLikelyText] = useState(true); // 仅识别“疑似含字图片”
+  const [ocrConcurrency, setOcrConcurrency] = useState(2); // 并发（越大越卡）
 
-  // 三方库是否就绪（CDN 注入）
-  const [libsReady, setLibsReady] = useState(false);
+  // progress
+  const [progress, setProgress] = useState({ stage: "", done: 0, total: 0, note: "" });
 
-  // 最终结果：extract + audit + aiReport + ocrText
+  // result
   const [result, setResult] = useState(null);
 
   async function safeJson(resp) {
@@ -25,7 +32,173 @@ export default function Home() {
     }
   }
 
-  // 判定“AI 是否生效”：后端 ok:true 且 rules_issues_fix 非空
+  // ----------------------------
+  // PPTX (browser) extract
+  // ----------------------------
+  function decodeBasicEntities(s) {
+    return String(s || "")
+      .replace(/&amp;/g, "&")
+      .replace(/&lt;/g, "<")
+      .replace(/&gt;/g, ">")
+      .replace(/&quot;/g, '"')
+      .replace(/&#39;/g, "'");
+  }
+
+  function xmlTextToPlain(xml) {
+    const texts = [];
+    const re = /<a:t[^>]*>([\s\S]*?)<\/a:t>/g;
+    let m;
+    while ((m = re.exec(xml))) {
+      const s = decodeBasicEntities(m[1] || "");
+      if (s.trim()) texts.push(s.trim());
+    }
+    return texts.join(" ");
+  }
+
+  async function extractPptxInBrowser(pptxFile) {
+    const name = (pptxFile?.name || "").toLowerCase();
+    if (!name.endsWith(".pptx")) return { ok: false, error: "仅支持 .pptx（请将 ppt 另存为 pptx）" };
+    if (!zipReady || !window.JSZip) return { ok: false, error: "解析组件未就绪（JSZip 未加载）" };
+
+    const JSZip = window.JSZip;
+    const ab = await pptxFile.arrayBuffer();
+    const zip = await JSZip.loadAsync(ab);
+
+    const slidePaths = Object.keys(zip.files)
+      .filter((p) => /^ppt\/slides\/slide\d+\.xml$/.test(p))
+      .sort((a, b) => {
+        const na = Number((a.match(/slide(\d+)\.xml/) || [])[1] || 0);
+        const nb = Number((b.match(/slide(\d+)\.xml/) || [])[1] || 0);
+        return na - nb;
+      });
+
+    const pages = [];
+    for (let i = 0; i < slidePaths.length; i++) {
+      const p = slidePaths[i];
+      const xml = await zip.file(p).async("string");
+      const content = xmlTextToPlain(xml);
+      pages.push({ page: i + 1, content });
+    }
+
+    // images (ppt/media/*)
+    const mediaPaths = Object.keys(zip.files)
+      .filter((p) => /^ppt\/media\/.+\.(png|jpg|jpeg|webp)$/i.test(p))
+      .sort();
+
+    const images = [];
+    for (const p of mediaPaths) {
+      const blob = await zip.file(p).async("blob");
+      images.push({ name: p.split("/").pop(), path: p, blob, size: blob.size });
+    }
+
+    return { ok: true, pages, images };
+  }
+
+  // get image dimensions in browser
+  async function getImageSize(blob) {
+    return new Promise((resolve) => {
+      const url = URL.createObjectURL(blob);
+      const img = new Image();
+      img.onload = () => {
+        const out = { w: img.naturalWidth || 0, h: img.naturalHeight || 0 };
+        URL.revokeObjectURL(url);
+        resolve(out);
+      };
+      img.onerror = () => {
+        URL.revokeObjectURL(url);
+        resolve({ w: 0, h: 0 });
+      };
+      img.src = url;
+    });
+  }
+
+  // heuristic: likely contains text
+  async function filterLikelyTextImages(images) {
+    // 经验阈值：太小的图往往是 icon/背景；太小分辨率 OCR 价值低
+    const MIN_BYTES = 40 * 1024; // 40KB
+    const MIN_W = 600;
+    const MIN_H = 350;
+
+    const out = [];
+    for (const it of images) {
+      if (it.size < MIN_BYTES) continue;
+      const { w, h } = await getImageSize(it.blob);
+      if (w >= MIN_W && h >= MIN_H) out.push({ ...it, w, h });
+    }
+    return out;
+  }
+
+  // ----------------------------
+  // OCR (browser) - batching
+  // ----------------------------
+  async function ocrOne(blob, logger) {
+    if (!ocrReady || !window.Tesseract) throw new Error("OCR 组件未就绪（Tesseract 未加载）");
+    const T = window.Tesseract;
+
+    // 优先中文+英文；失败再降级英文，提升稳定性
+    try {
+      const r = await T.recognize(blob, "chi_sim+eng", {
+        logger: logger || (() => {})
+      });
+      return String(r?.data?.text || "").trim();
+    } catch {
+      const r2 = await T.recognize(blob, "eng", {
+        logger: logger || (() => {})
+      });
+      return String(r2?.data?.text || "").trim();
+    }
+  }
+
+  async function runPool(items, concurrency, worker) {
+    const results = new Array(items.length);
+    let idx = 0;
+    const runners = new Array(concurrency).fill(0).map(async () => {
+      while (idx < items.length) {
+        const cur = idx++;
+        results[cur] = await worker(items[cur], cur);
+      }
+    });
+    await Promise.all(runners);
+    return results;
+  }
+
+  async function ocrImagesInBatches(images) {
+    const total = images.length;
+    const outTexts = [];
+
+    let processed = 0;
+    for (let start = 0; start < total; start += batchSize) {
+      const batch = images.slice(start, start + batchSize);
+
+      setProgress({
+        stage: "图片识别",
+        done: processed,
+        total,
+        note: `第 ${Math.floor(start / batchSize) + 1} 批 / 共 ${Math.ceil(total / batchSize)} 批`
+      });
+
+      const batchTexts = await runPool(batch, ocrConcurrency, async (img, i) => {
+        const text = await ocrOne(img.blob);
+        processed += 1;
+        setProgress({
+          stage: "图片识别",
+          done: processed,
+          total,
+          note: `正在识别：${img.name || `img_${start + i + 1}`}`
+        });
+        return { name: img.name, text };
+      });
+
+      outTexts.push(...batchTexts);
+    }
+
+    setProgress({ stage: "图片识别", done: total, total, note: "完成" });
+    return outTexts;
+  }
+
+  // ----------------------------
+  // AI helpers
+  // ----------------------------
   function isAiReportEffective(aiReportRaw) {
     if (!aiReportRaw || typeof aiReportRaw !== "object") return false;
     if (aiReportRaw.ok !== true) return false;
@@ -33,11 +206,9 @@ export default function Home() {
     return true;
   }
 
-  // 规范化成 report 结构（只做展示转换）
   function normalizeAiReport(aiReportRaw) {
     if (!aiReportRaw || typeof aiReportRaw !== "object") return null;
 
-    // report 结构
     if (aiReportRaw?.final_summary && Array.isArray(aiReportRaw?.rules_issues_fix)) {
       return {
         ok: aiReportRaw.ok === true,
@@ -47,7 +218,6 @@ export default function Home() {
       };
     }
 
-    // legacy：{ ai: [...] } -> report
     const legacy = aiReportRaw?.ai;
     if (Array.isArray(legacy)) {
       return {
@@ -74,164 +244,117 @@ export default function Home() {
     return null;
   }
 
-  // --- OCR：浏览器端解包 PPTX 的 ppt/media/* 图片，逐张 OCR ---
-  async function ocrPptxImages(pptxFile, opts = {}) {
-    const { maxConcurrency = 2 } = opts;
-
-    // 只支持 pptx（ppt 不是 zip）
-    const name = (pptxFile?.name || "").toLowerCase();
-    if (!name.endsWith(".pptx")) {
-      return { ok: false, text: "", error: "仅支持 PPTX 图片 OCR（.ppt 不是 zip，无法直接解包）。请另存为 .pptx 再试。" };
+  // 前端再做一次去重：相同 rule_id + page + before + after 的，只留一条
+  function dedupeFixes(fixes) {
+    const seen = new Set();
+    const out = [];
+    for (const it of fixes || []) {
+      const rw0 = Array.isArray(it?.rewrite) && it.rewrite[0] ? it.rewrite[0] : {};
+      const key = `${it?.rule_id || ""}__${it?.page ?? ""}__${String(rw0.before || "").trim()}__${String(
+        rw0.after || ""
+      ).trim()}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(it);
     }
-
-    if (!libsReady || typeof window === "undefined") {
-      return { ok: false, text: "", error: "OCR 依赖库未加载完成（JSZip/Tesseract）。请稍等 1-2 秒再点审核。" };
-    }
-
-    const JSZip = window.JSZip;
-    const Tesseract = window.Tesseract;
-    if (!JSZip || !Tesseract) {
-      return { ok: false, text: "", error: "OCR 依赖库缺失（JSZip/Tesseract 未注入）。" };
-    }
-
-    setOcrStatus({ stage: "loading_zip", done: 0, total: 0, msg: "解包 PPTX 中..." });
-
-    const ab = await pptxFile.arrayBuffer();
-    const zip = await JSZip.loadAsync(ab);
-
-    const mediaFiles = Object.keys(zip.files)
-      .filter((p) => /^ppt\/media\//.test(p))
-      .filter((p) => /\.(png|jpg|jpeg|webp)$/i.test(p))
-      .sort();
-
-    const total = mediaFiles.length;
-    setOcrStatus({ stage: "found_images", done: 0, total, msg: total ? `发现 ${total} 张图片，开始 OCR...` : "未发现图片" });
-
-    if (total === 0) return { ok: true, text: "", images: 0 };
-
-    // 简单并发池
-    let idx = 0;
-    let done = 0;
-    const outputs = [];
-
-    async function worker(workerId) {
-      while (idx < mediaFiles.length) {
-        const myIdx = idx++;
-        const path = mediaFiles[myIdx];
-
-        try {
-          const blob = await zip.file(path).async("blob");
-
-          // 识别：中英混合
-          const r = await Tesseract.recognize(blob, "chi_sim+eng", {
-            logger: () => {}
-          });
-
-          const text = (r?.data?.text || "").trim();
-          if (text) {
-            outputs.push(`【图片OCR：${path.replace("ppt/media/", "")}】\n${text}`);
-          }
-        } catch (e) {
-          // 单张失败不影响整体
-          outputs.push(`【图片OCR：${path.replace("ppt/media/", "")}】\n（OCR失败：${String(e?.message || e)}）`);
-        } finally {
-          done++;
-          setOcrStatus({
-            stage: "ocring",
-            done,
-            total,
-            msg: `OCR 进行中：${done}/${total}`
-          });
-        }
-      }
-    }
-
-    const workers = [];
-    const cc = Math.max(1, Math.min(maxConcurrency, 4)); // 保护：最多 4 并发，避免浏览器卡死
-    for (let i = 0; i < cc; i++) workers.push(worker(i));
-    await Promise.all(workers);
-
-    setOcrStatus({ stage: "done", done: total, total, msg: "OCR 完成" });
-
-    // 把所有图片 OCR 拼成一个大段
-    const merged = outputs.join("\n\n");
-    return { ok: true, text: merged, images: total };
+    return out;
   }
 
-  // --- （可选）AI 侧去重：把 audit.issues 的重复项在送 AI 前合并，减少重复输出 ---
-  function dedupeIssuesForAi(audit) {
-    const issues = Array.isArray(audit?.issues) ? audit.issues : [];
-    const map = new Map();
-
-    for (const it of issues) {
-      const key = `${it.rule_id || ""}__${it.page ?? ""}__${it.type || ""}__${it.hit || ""}__${it.message || ""}`;
-      if (!map.has(key)) map.set(key, it);
-    }
-
-    const deduped = Array.from(map.values());
-
-    // 返回一个“浅拷贝”的 audit，保证不影响你原 audit 展示
-    return { ...audit, issues: deduped };
-  }
-
+  // ----------------------------
+  // Run
+  // ----------------------------
   async function onRun() {
     if (!file) {
-      alert("请先选择文件（ppt/pptx/docx/txt）");
+      alert("请先选择文件");
       return;
     }
+
     setLoading(true);
     setResult(null);
-    setOcrStatus({ stage: "idle", done: 0, total: 0, msg: "" });
+    setProgress({ stage: "准备", done: 0, total: 0, note: "" });
 
     try {
-      // 1) Extract（仍用你后端 extract 提取文字）
-      const fd = new FormData();
-      fd.append("file", file);
+      const fname = (file?.name || "").toLowerCase();
+      let extract;
 
-      const r1 = await fetch("/api/extract", { method: "POST", body: fd });
-      const extract = await safeJson(r1);
+      // 1) Extract
+      if (fname.endsWith(".pptx")) {
+        setProgress({ stage: "解析课件", done: 0, total: 1, note: "本地解析 PPTX（不上传文件）" });
+        extract = await extractPptxInBrowser(file);
+      } else {
+        // docx/txt 继续走后端
+        setProgress({ stage: "解析课件", done: 0, total: 1, note: "上传并提取文本" });
+        const fd = new FormData();
+        fd.append("file", file);
+        const r1 = await fetch("/api/extract", { method: "POST", body: fd });
+        extract = await safeJson(r1);
+      }
 
       if (!extract.ok || !Array.isArray(extract.pages) || extract.pages.length === 0) {
-        setResult({ stage: "error", message: "提取失败：未获取到页面内容", detail: extract });
+        setResult({
+          stage: "error",
+          title: "处理失败",
+          message: extract?.error || "提取失败：未获取到页面内容",
+          detail: extract
+        });
         return;
       }
 
-      // 2) Rules Audit（rules.json 检测）
+      // 2) OCR images (optional, only for pptx)
+      let ocrTexts = [];
+      if (fname.endsWith(".pptx") && enableOcr) {
+        let images = Array.isArray(extract.images) ? extract.images : [];
+
+        // 限制最大图片数
+        if (images.length > maxImages) images = images.slice(0, maxImages);
+
+        // 只挑“高概率含字”
+        if (onlyLikelyText) {
+          setProgress({ stage: "筛选图片", done: 0, total: images.length, note: "筛选疑似含字图片" });
+          images = await filterLikelyTextImages(images);
+        }
+
+        if (images.length > 0) {
+          ocrTexts = await ocrImagesInBatches(images);
+        }
+      }
+
+      // 组装 pages（把 OCR 文本合并到末尾页）
+      const pages = [...extract.pages];
+      if (ocrTexts.length > 0) {
+        const joined = ocrTexts
+          .map((x) => (x?.text ? `【${x.name || "图片"}】\n${x.text}` : ""))
+          .filter(Boolean)
+          .join("\n\n");
+
+        if (joined.trim()) {
+          pages.push({
+            page: pages.length + 1,
+            content: `【图片识别内容】\n${joined}`.slice(0, 50000) // 防止过大
+          });
+        }
+      }
+
+      // 3) Rules Audit
+      setProgress({ stage: "规则审核", done: 0, total: 1, note: "按 rules/rules.json 检测" });
       const r2 = await fetch("/api/audit", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ pages: extract.pages })
+        body: JSON.stringify({ pages })
       });
       const audit = await safeJson(r2);
 
       if (!audit || typeof audit !== "object") {
-        setResult({ stage: "error", message: "规则审核失败：返回异常", detail: audit });
+        setResult({ stage: "error", title: "处理失败", message: "规则审核失败：返回异常", detail: audit });
         return;
       }
 
-      // 2.5) 可选：给 AI 的 issues 去重，减少重复整改项
-      const auditForAi = dedupeIssuesForAi(audit);
+      // 4) AI report
+      setProgress({ stage: "AI 复核", done: 0, total: 1, note: "生成融合报告与整改建议" });
 
-      // 3) 浏览器 OCR（仅 PPTX）
-      let ocrText = "";
-      let ocrMeta = null;
-      if (enableOcr) {
-        const ocr = await ocrPptxImages(file, { maxConcurrency: 2 });
-        ocrMeta = ocr;
-        if (ocr.ok && ocr.text) ocrText = ocr.text;
-      }
+      const pagesText = pages.map((p) => `【第${p.page}页】\n${p.content || ""}`).join("\n\n");
 
-      // 4) AI Review（report 模式）
-      const pagesText = (extract.pages || [])
-        .map((p) => `【第${p.page || ""}页】\n${p.content || ""}`)
-        .join("\n\n");
-
-      // 把 OCR 文本拼到全文后面给 AI（规则仍以 audit 为准）
-      const pagesTextWithOcr = ocrText
-        ? `${pagesText}\n\n====================\n【图片OCR补充内容】\n${ocrText}\n`
-        : pagesText;
-
-      // 从后端接口取 rulesJson（你现在的 /api/rules 会读 rules/rules.json）
+      // 取 rulesJson
       let rulesJson = "";
       let rulesOk = false;
       try {
@@ -249,8 +372,8 @@ export default function Home() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           mode: "report",
-          pagesText: pagesTextWithOcr,
-          audit: auditForAi,
+          pagesText,
+          audit,
           rulesJson
         })
       });
@@ -259,267 +382,489 @@ export default function Home() {
       const aiReport = normalizeAiReport(aiReportRaw);
       const aiUsed = isAiReportEffective(aiReportRaw);
 
+      const fixes = aiUsed && Array.isArray(aiReport?.rules_issues_fix) ? dedupeFixes(aiReport.rules_issues_fix) : [];
+
+      setProgress({ stage: "完成", done: 1, total: 1, note: "" });
       setResult({
         stage: "done",
-        extract,
-        audit, // 原 audit 用于页面展示（不去重）
-        auditForAi, // 给 AI 的 audit（去重后）
+        audit,
         aiReport,
         aiUsed,
         rulesOk,
         aiHttpStatus: r3.status,
         aiRaw: aiReportRaw,
-        ocrMeta,
-        ocrTextPreview: ocrText ? ocrText.slice(0, 800) : ""
+        fixes,
+        meta: {
+          pages: pages.length,
+          ocrAdded: ocrTexts.length > 0,
+          ocrCount: ocrTexts.length
+        }
       });
     } catch (e) {
-      setResult({ stage: "error", message: "客户端异常", detail: String(e?.message || e) });
+      setResult({ stage: "error", title: "处理失败", message: "客户端异常", detail: String(e?.message || e) });
     } finally {
       setLoading(false);
     }
   }
 
+  // ----------------------------
+  // UI computed
+  // ----------------------------
   const auditPass = result?.audit?.pass === true;
   const riskLevel = result?.audit?.risk_level || "unknown";
   const ai = result?.aiReport;
+  const fixesToShow = Array.isArray(result?.fixes) ? result.fixes : [];
 
-  const fixesToShow = result?.aiUsed && Array.isArray(ai?.rules_issues_fix) ? ai.rules_issues_fix : [];
+  const statusChip = useMemo(() => {
+    if (!result) return { text: "待开始", tone: "muted" };
+    if (result.stage === "error") return { text: "失败", tone: "bad" };
+    if (result.stage === "done") {
+      if (auditPass) return { text: "通过", tone: "good" };
+      return { text: "需整改", tone: riskLevel === "high" ? "bad" : "warn" };
+    }
+    return { text: "处理中", tone: "warn" };
+  }, [result, auditPass, riskLevel]);
 
-  const ocrTip = useMemo(() => {
-    if (!enableOcr) return "OCR：关闭（只用提取文本 + 规则 + AI）";
-    if (!libsReady) return "OCR：依赖库加载中（JSZip/Tesseract）...";
-    if (ocrStatus.stage === "idle") return "OCR：开启（PPTX 图片将尝试识别）";
-    return `OCR：${ocrStatus.msg || ""}`;
-  }, [enableOcr, libsReady, ocrStatus]);
+  function toneStyle(tone) {
+    if (tone === "good") return { background: "#ecfdf3", border: "1px solid #a7f3d0", color: "#065f46" };
+    if (tone === "warn") return { background: "#fffbeb", border: "1px solid #fde68a", color: "#92400e" };
+    if (tone === "bad") return { background: "#fef2f2", border: "1px solid #fecaca", color: "#991b1b" };
+    return { background: "#f8fafc", border: "1px solid #e5e7eb", color: "#334155" };
+  }
 
-  useEffect(() => {
-    // CDN 脚本加载后会触发 onLoad 设置 libsReady
-  }, []);
+  const canRun = !!file && !loading;
 
   return (
-    <div style={{ maxWidth: 980, margin: "28px auto", padding: 16, fontFamily: "system-ui, -apple-system" }}>
-      {/* CDN：不用 npm 安装，Vercel 和局域网都能跑 */}
+    <div style={{ minHeight: "100vh", background: "#f6f7fb" }}>
+      {/* CDN libs (no npm install) */}
       <Script
         src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"
-        strategy="beforeInteractive"
-        onLoad={() => {
-          // 两个都加载完才 ready（下面 Tesseract 的 onLoad 也会 set）
-          setTimeout(() => {
-            if (window.JSZip && window.Tesseract) setLibsReady(true);
-          }, 0);
-        }}
+        strategy="afterInteractive"
+        onLoad={() => setZipReady(true)}
       />
       <Script
         src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"
-        strategy="beforeInteractive"
-        onLoad={() => {
-          setTimeout(() => {
-            if (window.JSZip && window.Tesseract) setLibsReady(true);
-          }, 0);
-        }}
+        strategy="afterInteractive"
+        onLoad={() => setOcrReady(true)}
       />
 
-      <h2>课件合规初审（规则 + AI + 图片OCR）</h2>
-
-      <div style={{ border: "1px solid #ddd", borderRadius: 10, padding: 14 }}>
-        <div style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
-          <input
-            type="file"
-            accept=".ppt,.pptx,.docx,.txt"
-            onChange={(e) => setFile(e.target.files?.[0] || null)}
-          />
-
-          <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 13, color: "#444" }}>
-            <input
-              type="checkbox"
-              checked={enableOcr}
-              onChange={(e) => setEnableOcr(e.target.checked)}
-            />
-            启用 PPTX 图片 OCR（免费，浏览器本地识别）
-          </label>
-        </div>
-
-        <div style={{ marginTop: 8, fontSize: 13, color: "#666" }}>{ocrTip}</div>
-
-        <div style={{ marginTop: 10 }}>
-          <button onClick={onRun} disabled={loading} style={{ padding: "8px 14px" }}>
-            {loading ? "审核中..." : "一键审核（提取 → 规则 → OCR → AI融合报告）"}
-          </button>
-        </div>
-
-        <div style={{ marginTop: 10, color: "#666", fontSize: 13 }}>
-          支持：pptx/docx/txt（图片OCR仅 pptx；ppt 请另存为 pptx）
-        </div>
-      </div>
-
-      <div style={{ marginTop: 18 }}>
-        <h3>结果</h3>
-
-        {!result && <div style={{ color: "#666" }}>上传文件后点击“一键审核”。</div>}
-
-        {result && result.stage === "error" && (
-          <div style={{ border: "1px solid #f0d7d7", background: "#fff5f5", borderRadius: 10, padding: 12 }}>
-            <div style={{ fontWeight: 700, marginBottom: 6 }}>失败</div>
-            <div style={{ whiteSpace: "pre-wrap" }}>{result.message || "（无）"}</div>
-            {result.detail ? (
-              <pre style={{ marginTop: 8, whiteSpace: "pre-wrap", background: "#fafafa", padding: 10, borderRadius: 8 }}>
-                {JSON.stringify(result.detail, null, 2)}
-              </pre>
-            ) : null}
+      <div style={{ maxWidth: 980, margin: "0 auto", padding: "22px 16px 40px" }}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
+          <div>
+            <div style={{ fontSize: 18, fontWeight: 800, letterSpacing: 0.2 }}>课件审核</div>
+            <div style={{ fontSize: 12, color: "#64748b", marginTop: 4 }}>
+              上传后自动完成：文本提取 → 规则检测 → AI 复核（可选：图片文字识别）
+            </div>
           </div>
-        )}
 
-        {result && result.stage === "done" && (
-          <>
-            <div style={{ marginBottom: 10, fontWeight: 700 }}>
-              规则审核：{auditPass ? "通过" : "不通过"}（risk_level：{riskLevel}）
+          <div
+            style={{
+              padding: "6px 10px",
+              borderRadius: 999,
+              fontSize: 12,
+              fontWeight: 700,
+              ...toneStyle(statusChip.tone)
+            }}
+          >
+            {statusChip.text}
+          </div>
+        </div>
+
+        {/* Card: Upload */}
+        <div
+          style={{
+            marginTop: 14,
+            background: "#fff",
+            border: "1px solid #e5e7eb",
+            borderRadius: 14,
+            padding: 14,
+            boxShadow: "0 6px 18px rgba(15, 23, 42, 0.06)"
+          }}
+        >
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 12, alignItems: "center", justifyContent: "space-between" }}>
+            <div style={{ flex: "1 1 420px" }}>
+              <div style={{ fontSize: 13, fontWeight: 700, marginBottom: 8, color: "#0f172a" }}>选择文件</div>
+              <input
+                type="file"
+                accept=".pptx,.docx,.txt"
+                onChange={(e) => setFile(e.target.files?.[0] || null)}
+                style={{
+                  width: "100%",
+                  padding: "10px 12px",
+                  borderRadius: 12,
+                  border: "1px solid #e5e7eb",
+                  background: "#f8fafc"
+                }}
+              />
+              <div style={{ marginTop: 8, fontSize: 12, color: "#64748b" }}>
+                支持：PPTX / DOCX / TXT（PPTX 会在浏览器本地解析，避免上传过大失败）
+              </div>
             </div>
 
-            <div style={{ marginBottom: 10, color: "#666", fontSize: 13 }}>
-              AI 融合复核：{result.aiUsed ? "已生效（AI 输出）" : `未生效（接口返回 ${result.aiHttpStatus}）`}
-              {" · "}
-              规则库读取：{result.rulesOk ? "正常" : "异常（/api/rules 可能没返回 rulesJson）"}
-              {" · "}
-              OCR：{enableOcr ? (result.ocrMeta?.ok ? `已尝试（图片 ${result.ocrMeta.images || 0} 张）` : `失败/跳过`) : "关闭"}
+            <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+              <button
+                onClick={onRun}
+                disabled={!canRun}
+                style={{
+                  padding: "10px 14px",
+                  borderRadius: 12,
+                  border: "1px solid #1f2937",
+                  background: canRun ? "#111827" : "#9ca3af",
+                  color: "#fff",
+                  fontWeight: 800,
+                  cursor: canRun ? "pointer" : "not-allowed",
+                  minWidth: 120
+                }}
+              >
+                {loading ? "处理中…" : "开始审核"}
+              </button>
+            </div>
+          </div>
+
+          {/* Options */}
+          <div
+            style={{
+              marginTop: 12,
+              display: "flex",
+              flexWrap: "wrap",
+              gap: 10,
+              alignItems: "center",
+              paddingTop: 12,
+              borderTop: "1px dashed #e5e7eb"
+            }}
+          >
+            <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, color: "#0f172a" }}>
+              <input
+                type="checkbox"
+                checked={enableOcr}
+                onChange={(e) => setEnableOcr(e.target.checked)}
+                disabled={!ocrReady}
+              />
+              识别图片文字（OCR）
+              <span style={{ color: "#64748b" }}>
+                {!ocrReady ? "（OCR 组件加载中）" : ""}
+              </span>
+            </label>
+
+            <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, color: "#0f172a" }}>
+              <input
+                type="checkbox"
+                checked={onlyLikelyText}
+                onChange={(e) => setOnlyLikelyText(e.target.checked)}
+                disabled={!enableOcr}
+              />
+              只识别疑似含字图片
+            </label>
+
+            <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, color: "#0f172a" }}>
+              每批
+              <select
+                value={batchSize}
+                onChange={(e) => setBatchSize(Number(e.target.value))}
+                disabled={!enableOcr}
+                style={{ padding: "6px 10px", borderRadius: 10, border: "1px solid #e5e7eb", background: "#fff" }}
+              >
+                <option value={15}>15</option>
+                <option value={30}>30</option>
+                <option value={50}>50</option>
+              </select>
+              张
             </div>
 
-            {/* OCR 失败原因（可读） */}
-            {enableOcr && result.ocrMeta && result.ocrMeta.ok === false && (
-              <div style={{ border: "1px solid #eee", background: "#fafafa", borderRadius: 10, padding: 10, marginBottom: 12 }}>
-                <div style={{ fontWeight: 700, marginBottom: 6 }}>OCR 未生效原因</div>
-                <div style={{ whiteSpace: "pre-wrap", fontSize: 13, color: "#444" }}>{result.ocrMeta.error || "（无）"}</div>
+            <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, color: "#0f172a" }}>
+              最多识别
+              <input
+                value={maxImages}
+                onChange={(e) => setMaxImages(Math.max(0, Number(e.target.value || 0)))}
+                disabled={!enableOcr}
+                style={{
+                  width: 76,
+                  padding: "6px 10px",
+                  borderRadius: 10,
+                  border: "1px solid #e5e7eb",
+                  background: "#fff"
+                }}
+              />
+              张
+            </div>
+
+            <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, color: "#0f172a" }}>
+              并发
+              <select
+                value={ocrConcurrency}
+                onChange={(e) => setOcrConcurrency(Number(e.target.value))}
+                disabled={!enableOcr}
+                style={{ padding: "6px 10px", borderRadius: 10, border: "1px solid #e5e7eb", background: "#fff" }}
+              >
+                <option value={1}>1</option>
+                <option value={2}>2</option>
+                <option value={3}>3</option>
+              </select>
+            </div>
+
+            <div style={{ marginLeft: "auto", fontSize: 12, color: "#64748b" }}>
+              组件：{zipReady ? "PPTX 解析就绪" : "PPTX 解析加载中"} / {ocrReady ? "OCR 就绪" : "OCR 加载中"}
+            </div>
+          </div>
+
+          {/* Progress */}
+          {loading && (
+            <div style={{ marginTop: 14 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, color: "#334155" }}>
+                <div style={{ fontWeight: 700 }}>{progress.stage || "处理中"}</div>
+                <div style={{ color: "#64748b" }}>{progress.note || ""}</div>
               </div>
-            )}
-
-            {/* AI 未生效原因 */}
-            {!result.aiUsed && result.aiRaw && (
-              <div style={{ border: "1px solid #eee", background: "#fafafa", borderRadius: 10, padding: 10, marginBottom: 12 }}>
-                <div style={{ fontWeight: 700, marginBottom: 6 }}>AI 未生效原因（/api/ai_review 返回）</div>
-                <div style={{ whiteSpace: "pre-wrap", fontSize: 13, color: "#444" }}>
-                  {result.aiRaw.error || result.aiRaw.detail || "（无 error/detail 字段）"}
-                </div>
-                {result.aiRaw.http_status ? (
-                  <div style={{ marginTop: 6, fontSize: 13, color: "#666" }}>DeepSeek http_status：{result.aiRaw.http_status}</div>
-                ) : null}
+              <div style={{ height: 10, background: "#eef2ff", borderRadius: 999, marginTop: 8, overflow: "hidden" }}>
+                <div
+                  style={{
+                    height: "100%",
+                    width:
+                      progress.total > 0 ? `${Math.min(100, Math.round((progress.done / progress.total) * 100))}%` : "35%",
+                    background: "#4f46e5"
+                  }}
+                />
               </div>
-            )}
-
-            {/* 融合报告 */}
-            {result.aiUsed && ai?.final_summary ? (
-              <div style={{ border: "1px solid #eee", borderRadius: 10, padding: 12, marginBottom: 12 }}>
-                <div style={{ fontWeight: 700, marginBottom: 6 }}>融合报告（AI 在规则基础上 + OCR补充内容 做复核）</div>
-
-                <div style={{ marginBottom: 8 }}>
-                  <div style={{ color: "#666", fontSize: 13, marginBottom: 4 }}>总体结论</div>
-                  <div style={{ whiteSpace: "pre-wrap" }}>{ai.final_summary.overall || "（无）"}</div>
+              {progress.total > 0 && (
+                <div style={{ marginTop: 6, fontSize: 12, color: "#64748b" }}>
+                  {progress.done} / {progress.total}
                 </div>
+              )}
+            </div>
+          )}
+        </div>
 
-                <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
-                  <div style={{ flex: "1 1 260px" }}>
-                    <div style={{ color: "#666", fontSize: 13, marginBottom: 4 }}>关键风险（最多3条）</div>
-                    <ul style={{ margin: 0, paddingLeft: 18 }}>
-                      {(ai.final_summary.top_risks || []).slice(0, 3).map((x, i) => (
-                        <li key={i}>{x}</li>
-                      ))}
-                      {(!ai.final_summary.top_risks || ai.final_summary.top_risks.length === 0) && <li>（无）</li>}
-                    </ul>
-                  </div>
+        {/* Result */}
+        <div style={{ marginTop: 14 }}>
+          {!result && (
+            <div style={{ fontSize: 13, color: "#64748b", padding: "10px 2px" }}>
+              选择文件后点击“开始审核”。
+            </div>
+          )}
 
-                  <div style={{ flex: "1 1 260px" }}>
-                    <div style={{ color: "#666", fontSize: 13, marginBottom: 4 }}>下一步建议（最多3条）</div>
-                    <ul style={{ margin: 0, paddingLeft: 18 }}>
-                      {(ai.final_summary.next_actions || []).slice(0, 3).map((x, i) => (
-                        <li key={i}>{x}</li>
-                      ))}
-                      {(!ai.final_summary.next_actions || ai.final_summary.next_actions.length === 0) && <li>（无）</li>}
-                    </ul>
-                  </div>
-                </div>
+          {result?.stage === "error" && (
+            <div
+              style={{
+                background: "#fff",
+                border: "1px solid #fecaca",
+                borderRadius: 14,
+                padding: 14,
+                boxShadow: "0 6px 18px rgba(15, 23, 42, 0.06)"
+              }}
+            >
+              <div style={{ fontWeight: 800, color: "#991b1b" }}>{result.title || "失败"}</div>
+              <div style={{ marginTop: 8, whiteSpace: "pre-wrap", color: "#334155", fontSize: 13 }}>
+                {result.message || "（无）"}
               </div>
-            ) : null}
 
-            <h4>可落地整改清单（按规则命中项逐条给改写）</h4>
+              {/* 少量可读信息，避免技术堆字 */}
+              {result?.detail?.http_status ? (
+                <div style={{ marginTop: 8, fontSize: 12, color: "#64748b" }}>
+                  状态码：{result.detail.http_status}
+                </div>
+              ) : null}
+            </div>
+          )}
 
-            {fixesToShow.length > 0 ? (
-              <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-                {fixesToShow.map((it, idx) => (
-                  <div key={idx} style={{ border: "1px solid #eee", borderRadius: 10, padding: 12 }}>
-                    <div style={{ fontWeight: 700, marginBottom: 6 }}>
-                      #{idx + 1}｜rule_id：{it.rule_id}｜页：{it.page}
+          {result?.stage === "done" && (
+            <>
+              {/* Summary Card */}
+              <div
+                style={{
+                  background: "#fff",
+                  border: "1px solid #e5e7eb",
+                  borderRadius: 14,
+                  padding: 14,
+                  boxShadow: "0 6px 18px rgba(15, 23, 42, 0.06)"
+                }}
+              >
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
+                  <div>
+                    <div style={{ fontSize: 14, fontWeight: 900, color: "#0f172a" }}>
+                      {auditPass ? "审核通过" : "发现问题（需整改）"}
                     </div>
+                    <div style={{ marginTop: 4, fontSize: 12, color: "#64748b" }}>
+                      风险等级：{riskLevel} · 页数：{result?.meta?.pages || "-"}
+                      {result?.meta?.ocrAdded ? ` · OCR已追加（${result.meta.ocrCount} 张图片）` : ""}
+                    </div>
+                  </div>
 
-                    {Array.isArray(it.quote) && it.quote.length > 0 && (
-                      <div style={{ marginBottom: 6 }}>
-                        <div style={{ color: "#666", fontSize: 13, marginBottom: 4 }}>定位原文（quote）</div>
-                        <ul style={{ margin: 0, paddingLeft: 18 }}>
-                          {it.quote.slice(0, 3).map((q, i) => (
-                            <li key={i} style={{ whiteSpace: "pre-wrap" }}>
-                              {q}
-                            </li>
-                          ))}
-                        </ul>
-                      </div>
-                    )}
+                  <div
+                    style={{
+                      padding: "6px 10px",
+                      borderRadius: 999,
+                      fontSize: 12,
+                      fontWeight: 800,
+                      ...toneStyle(auditPass ? "good" : riskLevel === "high" ? "bad" : "warn")
+                    }}
+                  >
+                    {auditPass ? "通过" : "需整改"}
+                  </div>
+                </div>
 
-                    {it.problem && (
-                      <div style={{ marginBottom: 6 }}>
-                        <div style={{ color: "#666", fontSize: 13, marginBottom: 4 }}>问题说明</div>
-                        <div style={{ whiteSpace: "pre-wrap" }}>{it.problem}</div>
-                      </div>
-                    )}
+                <div style={{ marginTop: 10, fontSize: 12, color: "#64748b" }}>
+                  AI：{result.aiUsed ? "已生成整改建议" : "未生成（请检查 /api/ai_review）"} · 规则库：{result.rulesOk ? "正常" : "异常"}
+                </div>
 
-                    <div>
-                      <div style={{ color: "#666", fontSize: 13, marginBottom: 4 }}>改写建议（before → after）</div>
-                      <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-                        {(it.rewrite || []).slice(0, 3).map((rw, i) => (
-                          <div key={i} style={{ background: "#f7f7f7", borderRadius: 8, padding: 10 }}>
-                            <div style={{ fontSize: 13, color: "#666", marginBottom: 4 }}>
-                              动作：{rw.action || "（无）"}
-                            </div>
-                            <div style={{ fontSize: 13, color: "#666" }}>before：</div>
-                            <div style={{ whiteSpace: "pre-wrap", marginBottom: 6 }}>{rw.before || "（无）"}</div>
-                            <div style={{ fontSize: 13, color: "#666" }}>after：</div>
-                            <div style={{ whiteSpace: "pre-wrap", fontWeight: 600 }}>{rw.after || "（无）"}</div>
-                          </div>
+                {!result.aiUsed && result.aiRaw && (
+                  <div
+                    style={{
+                      marginTop: 10,
+                      background: "#f8fafc",
+                      border: "1px solid #e5e7eb",
+                      borderRadius: 12,
+                      padding: 10,
+                      fontSize: 12,
+                      color: "#334155"
+                    }}
+                  >
+                    {result.aiRaw.error || result.aiRaw.detail || "AI 未返回可用结果"}
+                  </div>
+                )}
+              </div>
+
+              {/* AI report */}
+              {result.aiUsed && ai?.final_summary && (
+                <div
+                  style={{
+                    marginTop: 12,
+                    background: "#fff",
+                    border: "1px solid #e5e7eb",
+                    borderRadius: 14,
+                    padding: 14,
+                    boxShadow: "0 6px 18px rgba(15, 23, 42, 0.06)"
+                  }}
+                >
+                  <div style={{ fontSize: 13, fontWeight: 900, color: "#0f172a" }}>融合报告</div>
+
+                  <div style={{ marginTop: 10 }}>
+                    <div style={{ fontSize: 12, color: "#64748b" }}>总体结论</div>
+                    <div style={{ marginTop: 6, whiteSpace: "pre-wrap", fontSize: 13, color: "#0f172a" }}>
+                      {ai.final_summary.overall || "（无）"}
+                    </div>
+                  </div>
+
+                  <div style={{ display: "flex", gap: 14, flexWrap: "wrap", marginTop: 10 }}>
+                    <div style={{ flex: "1 1 280px" }}>
+                      <div style={{ fontSize: 12, color: "#64748b" }}>关键风险</div>
+                      <ul style={{ margin: "6px 0 0", paddingLeft: 18, fontSize: 13, color: "#0f172a" }}>
+                        {(ai.final_summary.top_risks || []).slice(0, 3).map((x, i) => (
+                          <li key={i}>{x}</li>
                         ))}
-                        {(!it.rewrite || it.rewrite.length === 0) && (
-                          <div style={{ background: "#f7f7f7", borderRadius: 8, padding: 10, color: "#666" }}>
-                            （AI 未返回改写建议）
-                          </div>
-                        )}
-                      </div>
+                        {(!ai.final_summary.top_risks || ai.final_summary.top_risks.length === 0) && <li>（无）</li>}
+                      </ul>
                     </div>
-
-                    {it.note && (
-                      <div style={{ marginTop: 8 }}>
-                        <div style={{ color: "#666", fontSize: 13, marginBottom: 4 }}>备注</div>
-                        <div style={{ whiteSpace: "pre-wrap" }}>{it.note}</div>
-                      </div>
-                    )}
+                    <div style={{ flex: "1 1 280px" }}>
+                      <div style={{ fontSize: 12, color: "#64748b" }}>下一步建议</div>
+                      <ul style={{ margin: "6px 0 0", paddingLeft: 18, fontSize: 13, color: "#0f172a" }}>
+                        {(ai.final_summary.next_actions || []).slice(0, 3).map((x, i) => (
+                          <li key={i}>{x}</li>
+                        ))}
+                        {(!ai.final_summary.next_actions || ai.final_summary.next_actions.length === 0) && <li>（无）</li>}
+                      </ul>
+                    </div>
                   </div>
-                ))}
-              </div>
-            ) : (
-              <div style={{ color: "#666" }}>
-                {result.aiUsed ? "（AI 未返回可用整改清单）" : "（AI 未生效：请先看上方原因并修后端）"}
-              </div>
-            )}
+                </div>
+              )}
 
-            <h4 style={{ marginTop: 14 }}>AI 额外发现（规则未覆盖/漏检的语义风险）</h4>
-            {result.aiUsed && Array.isArray(ai?.ai_extra) && ai.ai_extra.length > 0 ? (
-              <ul style={{ margin: 0, paddingLeft: 18 }}>
-                {ai.ai_extra.slice(0, 10).map((x, i) => (
-                  <li key={i} style={{ whiteSpace: "pre-wrap" }}>
-                    {typeof x === "string" ? x : JSON.stringify(x)}
-                  </li>
-                ))}
-              </ul>
-            ) : (
-              <div style={{ color: "#666" }}>（无）</div>
-            )}
-          </>
-        )}
+              {/* Fix list */}
+              <div
+                style={{
+                  marginTop: 12,
+                  background: "#fff",
+                  border: "1px solid #e5e7eb",
+                  borderRadius: 14,
+                  padding: 14,
+                  boxShadow: "0 6px 18px rgba(15, 23, 42, 0.06)"
+                }}
+              >
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
+                  <div style={{ fontSize: 13, fontWeight: 900, color: "#0f172a" }}>整改建议</div>
+                  <div style={{ fontSize: 12, color: "#64748b" }}>
+                    {fixesToShow.length > 0 ? `${fixesToShow.length} 条` : "（无）"}
+                  </div>
+                </div>
+
+                {result.aiUsed ? (
+                  fixesToShow.length > 0 ? (
+                    <div style={{ marginTop: 12, display: "flex", flexDirection: "column", gap: 10 }}>
+                      {fixesToShow.map((it, idx) => {
+                        const rw = Array.isArray(it.rewrite) ? it.rewrite : [];
+                        const rw0 = rw[0] || {};
+                        return (
+                          <div
+                            key={idx}
+                            style={{
+                              border: "1px solid #e5e7eb",
+                              borderRadius: 12,
+                              padding: 12,
+                              background: "#ffffff"
+                            }}
+                          >
+                            <div style={{ fontSize: 12, color: "#64748b" }}>
+                              #{idx + 1} · rule_id {it.rule_id} · 第 {it.page ?? "-"} 页
+                            </div>
+
+                            {Array.isArray(it.quote) && it.quote.length > 0 && (
+                              <div style={{ marginTop: 10 }}>
+                                <div style={{ fontSize: 12, color: "#64748b" }}>原文</div>
+                                <div style={{ marginTop: 6, whiteSpace: "pre-wrap", fontSize: 13, color: "#0f172a" }}>
+                                  {it.quote.slice(0, 1).join("\n")}
+                                </div>
+                              </div>
+                            )}
+
+                            {it.problem ? (
+                              <div style={{ marginTop: 10 }}>
+                                <div style={{ fontSize: 12, color: "#64748b" }}>问题</div>
+                                <div style={{ marginTop: 6, whiteSpace: "pre-wrap", fontSize: 13, color: "#0f172a" }}>
+                                  {it.problem}
+                                </div>
+                              </div>
+                            ) : null}
+
+                            <div style={{ marginTop: 10 }}>
+                              <div style={{ fontSize: 12, color: "#64748b" }}>建议</div>
+                              <div
+                                style={{
+                                  marginTop: 8,
+                                  background: "#f8fafc",
+                                  border: "1px solid #e5e7eb",
+                                  borderRadius: 12,
+                                  padding: 10
+                                }}
+                              >
+                                <div style={{ fontSize: 12, color: "#64748b" }}>替换为</div>
+                                <div style={{ marginTop: 6, whiteSpace: "pre-wrap", fontSize: 13, color: "#0f172a", fontWeight: 700 }}>
+                                  {String(rw0.after || "（无）")}
+                                </div>
+                              </div>
+                            </div>
+
+                            {it.note ? (
+                              <div style={{ marginTop: 10, fontSize: 12, color: "#64748b", whiteSpace: "pre-wrap" }}>
+                                {it.note}
+                              </div>
+                            ) : null}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  ) : (
+                    <div style={{ marginTop: 12, fontSize: 13, color: "#64748b" }}>AI 未返回可用整改建议。</div>
+                  )
+                ) : (
+                  <div style={{ marginTop: 12, fontSize: 13, color: "#64748b" }}>
+                    AI 未生成整改建议（请检查后端 /api/ai_review）。
+                  </div>
+                )}
+              </div>
+            </>
+          )}
+        </div>
       </div>
     </div>
+  );
+}
+
   );
 }
