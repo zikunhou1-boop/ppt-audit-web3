@@ -5,6 +5,9 @@ export default function Home() {
   const [file, setFile] = useState(null);
   const [loading, setLoading] = useState(false);
 
+  // 图片 OCR 进度
+  const [ocrProgress, setOcrProgress] = useState(null);
+
   // 最终结果：extract + audit + aiReport
   const [result, setResult] = useState(null);
 
@@ -66,16 +69,142 @@ export default function Home() {
     return null;
   }
 
+  // ===== 图片 OCR（Vercel + 局域网通用：本地依赖优先，CDN 兜底）=====
+  function isImageFile(f) {
+    if (!f) return false;
+    const name = (f.name || "").toLowerCase();
+    return (
+      name.endsWith(".png") ||
+      name.endsWith(".jpg") ||
+      name.endsWith(".jpeg") ||
+      name.endsWith(".webp") ||
+      (f.type || "").startsWith("image/")
+    );
+  }
+
+  async function loadTesseract() {
+    if (typeof window === "undefined") return null;
+    if (window.Tesseract) return window.Tesseract;
+
+    // 1) 局域网/本地：优先尝试本地依赖（你以后本地 npm install 后会更稳）
+    try {
+      const mod = await import("tesseract.js");
+      const T = mod?.default || mod;
+      if (T) {
+        window.Tesseract = T;
+        return T;
+      }
+    } catch {
+      // ignore，走 CDN
+    }
+
+    // 2) Vercel / 无安装：CDN 兜底
+    await new Promise((resolve, reject) => {
+      const s = document.createElement("script");
+      s.src = "https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js";
+      s.async = true;
+      s.onload = resolve;
+      s.onerror = reject;
+      document.body.appendChild(s);
+    });
+
+    return window.Tesseract;
+  }
+
+  async function ocrImageToText(imgFile) {
+    setOcrProgress(0);
+    const Tesseract = await loadTesseract();
+    if (!Tesseract) throw new Error("Tesseract load failed");
+
+    const { data } = await Tesseract.recognize(imgFile, "chi_sim+eng", {
+      logger: (m) => {
+        if (m?.status === "recognizing text" && typeof m.progress === "number") {
+          setOcrProgress(Math.round(m.progress * 100));
+        }
+      }
+    });
+
+    setOcrProgress(null);
+    return (data?.text || "").trim();
+  }
+
   async function onRun() {
     if (!file) {
-      alert("请先选择文件（ppt/pptx/docx/txt）");
+      alert("请先选择文件（ppt/pptx/docx/txt 或 图片 png/jpg）");
       return;
     }
     setLoading(true);
     setResult(null);
 
     try {
-      // 1) Extract
+      // ===== A) 图片：浏览器 OCR → audit → ai_review =====
+      if (isImageFile(file)) {
+        const ocrText = await ocrImageToText(file);
+
+        if (!ocrText || ocrText.trim().length < 5) {
+          setResult({ stage: "error", message: "OCR 识别结果为空/太短（请换更清晰的图片）" });
+          return;
+        }
+
+        const pages = [{ page: 1, content: ocrText }];
+
+        // Rules Audit
+        const r2 = await fetch("/api/audit", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ pages })
+        });
+        const audit = await safeJson(r2);
+
+        if (!audit || typeof audit !== "object") {
+          setResult({ stage: "error", message: "规则审核失败：返回异常", detail: audit });
+          return;
+        }
+
+        // 取 rulesJson
+        let rulesJson = "";
+        let rulesOk = false;
+        try {
+          const rr = await fetch("/api/rules");
+          const j = await safeJson(rr);
+          rulesJson = j?.rulesJson || "";
+          rulesOk = typeof rulesJson === "string" && rulesJson.trim().length > 0;
+        } catch {
+          rulesJson = "";
+          rulesOk = false;
+        }
+
+        // AI Review
+        const pagesText = `【第1页】\n${ocrText}`;
+        const r3 = await fetch("/api/ai_review", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            mode: "report",
+            pagesText,
+            audit,
+            rulesJson
+          })
+        });
+
+        const aiReportRaw = await safeJson(r3);
+        const aiReport = normalizeAiReport(aiReportRaw);
+        const aiUsed = isAiReportEffective(aiReportRaw);
+
+        setResult({
+          stage: "done",
+          extract: { ok: true, pages },
+          audit,
+          aiReport,
+          aiUsed,
+          rulesOk,
+          aiHttpStatus: r3.status,
+          aiRaw: aiReportRaw
+        });
+        return;
+      }
+
+      // ===== B) 文档：extract → audit → ai_review =====
       const fd = new FormData();
       fd.append("file", file);
 
@@ -87,7 +216,6 @@ export default function Home() {
         return;
       }
 
-      // 2) Rules Audit
       const r2 = await fetch("/api/audit", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -100,12 +228,10 @@ export default function Home() {
         return;
       }
 
-      // 3) AI Review（✅ 必调用 AI：report 模式融合复核）
       const pagesText = (extract.pages || [])
         .map((p) => `【第${p.page || ""}页】\n${p.content || ""}`)
         .join("\n\n");
 
-      // 从后端接口取 rulesJson
       let rulesJson = "";
       let rulesOk = false;
       try {
@@ -118,7 +244,6 @@ export default function Home() {
         rulesOk = false;
       }
 
-      // 强制调用 AI
       const r3 = await fetch("/api/ai_review", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -142,12 +267,13 @@ export default function Home() {
         aiUsed,
         rulesOk,
         aiHttpStatus: r3.status,
-        aiRaw: aiReportRaw // ✅ 用于展示失败原因
+        aiRaw: aiReportRaw
       });
     } catch (e) {
       setResult({ stage: "error", message: "客户端异常", detail: String(e?.message || e) });
     } finally {
       setLoading(false);
+      setOcrProgress(null);
     }
   }
 
@@ -166,16 +292,22 @@ export default function Home() {
         <div style={{ marginBottom: 10 }}>
           <input
             type="file"
-            accept=".ppt,.pptx,.docx,.txt"
+            accept=".ppt,.pptx,.docx,.txt,.png,.jpg,.jpeg,.webp"
             onChange={(e) => setFile(e.target.files?.[0] || null)}
           />
         </div>
 
         <button onClick={onRun} disabled={loading} style={{ padding: "8px 14px" }}>
-          {loading ? "审核中..." : "一键审核（提取 → 规则 → AI融合报告）"}
+          {loading ? "审核中..." : "一键审核（提取/图片OCR → 规则 → AI融合报告）"}
         </button>
 
-        <div style={{ marginTop: 12, color: "#666", fontSize: 13 }}>支持：ppt/pptx/docx/txt（图片识别暂未开启）</div>
+        <div style={{ marginTop: 12, color: "#666", fontSize: 13 }}>
+          支持：ppt/pptx/docx/txt + 图片 png/jpg/webp（图片先 OCR 再审核）
+        </div>
+
+        {typeof ocrProgress === "number" && (
+          <div style={{ marginTop: 10, color: "#666", fontSize: 13 }}>图片OCR识别中：{ocrProgress}%</div>
+        )}
       </div>
 
       <div style={{ marginTop: 18 }}>
@@ -202,9 +334,17 @@ export default function Home() {
               规则库读取：{result.rulesOk ? "正常" : "异常（/api/rules 可能没返回 rulesJson）"}
             </div>
 
-            {/* ✅ 未生效时直接展示原因（不用你去 Network 找） */}
+            {/* 未生效时直接展示原因 */}
             {!result.aiUsed && result.aiRaw && (
-              <div style={{ border: "1px solid #eee", background: "#fafafa", borderRadius: 10, padding: 10, marginBottom: 12 }}>
+              <div
+                style={{
+                  border: "1px solid #eee",
+                  background: "#fafafa",
+                  borderRadius: 10,
+                  padding: 10,
+                  marginBottom: 12
+                }}
+              >
                 <div style={{ fontWeight: 700, marginBottom: 6 }}>AI 未生效原因（/api/ai_review 返回）</div>
 
                 <div style={{ whiteSpace: "pre-wrap", fontSize: 13, color: "#444" }}>
@@ -348,3 +488,4 @@ export default function Home() {
     </div>
   );
 }
+
