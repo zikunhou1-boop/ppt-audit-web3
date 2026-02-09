@@ -6,16 +6,16 @@ export default function Home() {
   const [file, setFile] = useState(null);
   const [loading, setLoading] = useState(false);
 
-  // libs ready (CDN)
+  // CDN libs ready
   const [zipReady, setZipReady] = useState(false);
   const [ocrReady, setOcrReady] = useState(false);
 
   // options
   const [enableOcr, setEnableOcr] = useState(true);
-  const [batchSize, setBatchSize] = useState(30); // 每批图片数量
-  const [maxImages, setMaxImages] = useState(120); // 最大处理图片数量（防止卡死）
-  const [onlyLikelyText, setOnlyLikelyText] = useState(true); // 仅识别“疑似含字图片”
-  const [ocrConcurrency, setOcrConcurrency] = useState(2); // 并发（越大越卡）
+  const [batchSize, setBatchSize] = useState(30);
+  const [maxImages, setMaxImages] = useState(120);
+  const [onlyLikelyText, setOnlyLikelyText] = useState(true);
+  const [ocrConcurrency, setOcrConcurrency] = useState(2);
 
   // progress
   const [progress, setProgress] = useState({ stage: "", done: 0, total: 0, note: "" });
@@ -32,9 +32,7 @@ export default function Home() {
     }
   }
 
-  // ----------------------------
-  // PPTX (browser) extract
-  // ----------------------------
+  // ---------- PPTX parsing helpers ----------
   function decodeBasicEntities(s) {
     return String(s || "")
       .replace(/&amp;/g, "&")
@@ -80,7 +78,6 @@ export default function Home() {
       pages.push({ page: i + 1, content });
     }
 
-    // images (ppt/media/*)
     const mediaPaths = Object.keys(zip.files)
       .filter((p) => /^ppt\/media\/.+\.(png|jpg|jpeg|webp)$/i.test(p))
       .sort();
@@ -94,7 +91,6 @@ export default function Home() {
     return { ok: true, pages, images };
   }
 
-  // get image dimensions in browser
   async function getImageSize(blob) {
     return new Promise((resolve) => {
       const url = URL.createObjectURL(blob);
@@ -112,10 +108,8 @@ export default function Home() {
     });
   }
 
-  // heuristic: likely contains text
   async function filterLikelyTextImages(images) {
-    // 经验阈值：太小的图往往是 icon/背景；太小分辨率 OCR 价值低
-    const MIN_BYTES = 40 * 1024; // 40KB
+    const MIN_BYTES = 40 * 1024;
     const MIN_W = 600;
     const MIN_H = 350;
 
@@ -128,23 +122,15 @@ export default function Home() {
     return out;
   }
 
-  // ----------------------------
-  // OCR (browser) - batching
-  // ----------------------------
-  async function ocrOne(blob, logger) {
+  // ---------- OCR helpers ----------
+  async function ocrOne(blob) {
     if (!ocrReady || !window.Tesseract) throw new Error("OCR 组件未就绪（Tesseract 未加载）");
     const T = window.Tesseract;
-
-    // 优先中文+英文；失败再降级英文，提升稳定性
     try {
-      const r = await T.recognize(blob, "chi_sim+eng", {
-        logger: logger || (() => {})
-      });
+      const r = await T.recognize(blob, "chi_sim+eng");
       return String(r?.data?.text || "").trim();
     } catch {
-      const r2 = await T.recognize(blob, "eng", {
-        logger: logger || (() => {})
-      });
+      const r2 = await T.recognize(blob, "eng");
       return String(r2?.data?.text || "").trim();
     }
   }
@@ -165,11 +151,10 @@ export default function Home() {
   async function ocrImagesInBatches(images) {
     const total = images.length;
     const outTexts = [];
-
     let processed = 0;
+
     for (let start = 0; start < total; start += batchSize) {
       const batch = images.slice(start, start + batchSize);
-
       setProgress({
         stage: "图片识别",
         done: processed,
@@ -196,9 +181,7 @@ export default function Home() {
     return outTexts;
   }
 
-  // ----------------------------
-  // AI helpers
-  // ----------------------------
+  // ---------- AI helpers ----------
   function isAiReportEffective(aiReportRaw) {
     if (!aiReportRaw || typeof aiReportRaw !== "object") return false;
     if (aiReportRaw.ok !== true) return false;
@@ -244,7 +227,6 @@ export default function Home() {
     return null;
   }
 
-  // 前端再做一次去重：相同 rule_id + page + before + after 的，只留一条
   function dedupeFixes(fixes) {
     const seen = new Set();
     const out = [];
@@ -260,9 +242,7 @@ export default function Home() {
     return out;
   }
 
-  // ----------------------------
-  // Run
-  // ----------------------------
+  // ---------- main run ----------
   async function onRun() {
     if (!file) {
       alert("请先选择文件");
@@ -282,7 +262,6 @@ export default function Home() {
         setProgress({ stage: "解析课件", done: 0, total: 1, note: "本地解析 PPTX（不上传文件）" });
         extract = await extractPptxInBrowser(file);
       } else {
-        // docx/txt 继续走后端
         setProgress({ stage: "解析课件", done: 0, total: 1, note: "上传并提取文本" });
         const fd = new FormData();
         fd.append("file", file);
@@ -300,15 +279,12 @@ export default function Home() {
         return;
       }
 
-      // 2) OCR images (optional, only for pptx)
+      // 2) OCR (PPTX only)
       let ocrTexts = [];
       if (fname.endsWith(".pptx") && enableOcr) {
         let images = Array.isArray(extract.images) ? extract.images : [];
-
-        // 限制最大图片数
         if (images.length > maxImages) images = images.slice(0, maxImages);
 
-        // 只挑“高概率含字”
         if (onlyLikelyText) {
           setProgress({ stage: "筛选图片", done: 0, total: images.length, note: "筛选疑似含字图片" });
           images = await filterLikelyTextImages(images);
@@ -319,42 +295,39 @@ export default function Home() {
         }
       }
 
-      // 组装 pages（把 OCR 文本合并到末尾页）
+      // 3) Build pages (append OCR as extra page)
       const pages = [...extract.pages];
       if (ocrTexts.length > 0) {
         const joined = ocrTexts
           .map((x) => (x?.text ? `【${x.name || "图片"}】\n${x.text}` : ""))
           .filter(Boolean)
           .join("\n\n");
-
         if (joined.trim()) {
           pages.push({
             page: pages.length + 1,
-            content: `【图片识别内容】\n${joined}`.slice(0, 50000) // 防止过大
+            content: `【图片识别内容】\n${joined}`.slice(0, 50000)
           });
         }
       }
 
-      // 3) Rules Audit
-      setProgress({ stage: "规则审核", done: 0, total: 1, note: "按 rules/rules.json 检测" });
+      // 4) Rules audit
+      setProgress({ stage: "规则审核", done: 0, total: 1, note: "按本地 rules.json 检测" });
       const r2 = await fetch("/api/audit", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ pages })
       });
       const audit = await safeJson(r2);
-
       if (!audit || typeof audit !== "object") {
         setResult({ stage: "error", title: "处理失败", message: "规则审核失败：返回异常", detail: audit });
         return;
       }
 
-      // 4) AI report
-      setProgress({ stage: "AI 复核", done: 0, total: 1, note: "生成融合报告与整改建议" });
+      // 5) AI review
+      setProgress({ stage: "AI 复核", done: 0, total: 1, note: "生成融合报告" });
 
       const pagesText = pages.map((p) => `【第${p.page}页】\n${p.content || ""}`).join("\n\n");
 
-      // 取 rulesJson
       let rulesJson = "";
       let rulesOk = false;
       try {
@@ -370,18 +343,12 @@ export default function Home() {
       const r3 = await fetch("/api/ai_review", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          mode: "report",
-          pagesText,
-          audit,
-          rulesJson
-        })
+        body: JSON.stringify({ mode: "report", pagesText, audit, rulesJson })
       });
 
       const aiReportRaw = await safeJson(r3);
       const aiReport = normalizeAiReport(aiReportRaw);
       const aiUsed = isAiReportEffective(aiReportRaw);
-
       const fixes = aiUsed && Array.isArray(aiReport?.rules_issues_fix) ? dedupeFixes(aiReport.rules_issues_fix) : [];
 
       setProgress({ stage: "完成", done: 1, total: 1, note: "" });
@@ -394,11 +361,7 @@ export default function Home() {
         aiHttpStatus: r3.status,
         aiRaw: aiReportRaw,
         fixes,
-        meta: {
-          pages: pages.length,
-          ocrAdded: ocrTexts.length > 0,
-          ocrCount: ocrTexts.length
-        }
+        meta: { pages: pages.length, ocrAdded: ocrTexts.length > 0, ocrCount: ocrTexts.length }
       });
     } catch (e) {
       setResult({ stage: "error", title: "处理失败", message: "客户端异常", detail: String(e?.message || e) });
@@ -407,9 +370,7 @@ export default function Home() {
     }
   }
 
-  // ----------------------------
-  // UI computed
-  // ----------------------------
+  // ---------- UI helpers ----------
   const auditPass = result?.audit?.pass === true;
   const riskLevel = result?.audit?.risk_level || "unknown";
   const ai = result?.aiReport;
@@ -436,7 +397,6 @@ export default function Home() {
 
   return (
     <div style={{ minHeight: "100vh", background: "#f6f7fb" }}>
-      {/* CDN libs (no npm install) */}
       <Script
         src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"
         strategy="afterInteractive"
@@ -451,26 +411,16 @@ export default function Home() {
       <div style={{ maxWidth: 980, margin: "0 auto", padding: "22px 16px 40px" }}>
         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
           <div>
-            <div style={{ fontSize: 18, fontWeight: 800, letterSpacing: 0.2 }}>课件审核</div>
+            <div style={{ fontSize: 18, fontWeight: 800 }}>课件审核</div>
             <div style={{ fontSize: 12, color: "#64748b", marginTop: 4 }}>
-              上传后自动完成：文本提取 → 规则检测 → AI 复核（可选：图片文字识别）
+              文本提取 → 规则检测 → AI 复核（可选：图片文字识别）
             </div>
           </div>
-
-          <div
-            style={{
-              padding: "6px 10px",
-              borderRadius: 999,
-              fontSize: 12,
-              fontWeight: 700,
-              ...toneStyle(statusChip.tone)
-            }}
-          >
+          <div style={{ padding: "6px 10px", borderRadius: 999, fontSize: 12, fontWeight: 700, ...toneStyle(statusChip.tone) }}>
             {statusChip.text}
           </div>
         </div>
 
-        {/* Card: Upload */}
         <div
           style={{
             marginTop: 14,
@@ -497,7 +447,7 @@ export default function Home() {
                 }}
               />
               <div style={{ marginTop: 8, fontSize: 12, color: "#64748b" }}>
-                支持：PPTX / DOCX / TXT（PPTX 会在浏览器本地解析，避免上传过大失败）
+                支持：PPTX / DOCX / TXT（PPTX 浏览器本地解析，避免上传过大）
               </div>
             </div>
 
@@ -521,49 +471,21 @@ export default function Home() {
             </div>
           </div>
 
-          {/* Options */}
-          <div
-            style={{
-              marginTop: 12,
-              display: "flex",
-              flexWrap: "wrap",
-              gap: 10,
-              alignItems: "center",
-              paddingTop: 12,
-              borderTop: "1px dashed #e5e7eb"
-            }}
-          >
+          <div style={{ marginTop: 12, paddingTop: 12, borderTop: "1px dashed #e5e7eb", display: "flex", flexWrap: "wrap", gap: 10, alignItems: "center" }}>
             <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, color: "#0f172a" }}>
-              <input
-                type="checkbox"
-                checked={enableOcr}
-                onChange={(e) => setEnableOcr(e.target.checked)}
-                disabled={!ocrReady}
-              />
+              <input type="checkbox" checked={enableOcr} onChange={(e) => setEnableOcr(e.target.checked)} disabled={!ocrReady} />
               识别图片文字（OCR）
-              <span style={{ color: "#64748b" }}>
-                {!ocrReady ? "（OCR 组件加载中）" : ""}
-              </span>
+              <span style={{ color: "#64748b" }}>{!ocrReady ? "（加载中）" : ""}</span>
             </label>
 
             <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, color: "#0f172a" }}>
-              <input
-                type="checkbox"
-                checked={onlyLikelyText}
-                onChange={(e) => setOnlyLikelyText(e.target.checked)}
-                disabled={!enableOcr}
-              />
+              <input type="checkbox" checked={onlyLikelyText} onChange={(e) => setOnlyLikelyText(e.target.checked)} disabled={!enableOcr} />
               只识别疑似含字图片
             </label>
 
             <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, color: "#0f172a" }}>
               每批
-              <select
-                value={batchSize}
-                onChange={(e) => setBatchSize(Number(e.target.value))}
-                disabled={!enableOcr}
-                style={{ padding: "6px 10px", borderRadius: 10, border: "1px solid #e5e7eb", background: "#fff" }}
-              >
+              <select value={batchSize} onChange={(e) => setBatchSize(Number(e.target.value))} disabled={!enableOcr} style={{ padding: "6px 10px", borderRadius: 10, border: "1px solid #e5e7eb", background: "#fff" }}>
                 <option value={15}>15</option>
                 <option value={30}>30</option>
                 <option value={50}>50</option>
@@ -577,25 +499,14 @@ export default function Home() {
                 value={maxImages}
                 onChange={(e) => setMaxImages(Math.max(0, Number(e.target.value || 0)))}
                 disabled={!enableOcr}
-                style={{
-                  width: 76,
-                  padding: "6px 10px",
-                  borderRadius: 10,
-                  border: "1px solid #e5e7eb",
-                  background: "#fff"
-                }}
+                style={{ width: 76, padding: "6px 10px", borderRadius: 10, border: "1px solid #e5e7eb", background: "#fff" }}
               />
               张
             </div>
 
             <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, color: "#0f172a" }}>
               并发
-              <select
-                value={ocrConcurrency}
-                onChange={(e) => setOcrConcurrency(Number(e.target.value))}
-                disabled={!enableOcr}
-                style={{ padding: "6px 10px", borderRadius: 10, border: "1px solid #e5e7eb", background: "#fff" }}
-              >
+              <select value={ocrConcurrency} onChange={(e) => setOcrConcurrency(Number(e.target.value))} disabled={!enableOcr} style={{ padding: "6px 10px", borderRadius: 10, border: "1px solid #e5e7eb", background: "#fff" }}>
                 <option value={1}>1</option>
                 <option value={2}>2</option>
                 <option value={3}>3</option>
@@ -603,11 +514,10 @@ export default function Home() {
             </div>
 
             <div style={{ marginLeft: "auto", fontSize: 12, color: "#64748b" }}>
-              组件：{zipReady ? "PPTX 解析就绪" : "PPTX 解析加载中"} / {ocrReady ? "OCR 就绪" : "OCR 加载中"}
+              组件：{zipReady ? "PPTX就绪" : "PPTX加载中"} / {ocrReady ? "OCR就绪" : "OCR加载中"}
             </div>
           </div>
 
-          {/* Progress */}
           {loading && (
             <div style={{ marginTop: 14 }}>
               <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, color: "#334155" }}>
@@ -618,8 +528,7 @@ export default function Home() {
                 <div
                   style={{
                     height: "100%",
-                    width:
-                      progress.total > 0 ? `${Math.min(100, Math.round((progress.done / progress.total) * 100))}%` : "35%",
+                    width: progress.total > 0 ? `${Math.min(100, Math.round((progress.done / progress.total) * 100))}%` : "35%",
                     background: "#4f46e5"
                   }}
                 />
@@ -633,70 +542,28 @@ export default function Home() {
           )}
         </div>
 
-        {/* Result */}
         <div style={{ marginTop: 14 }}>
-          {!result && (
-            <div style={{ fontSize: 13, color: "#64748b", padding: "10px 2px" }}>
-              选择文件后点击“开始审核”。
-            </div>
-          )}
+          {!result && <div style={{ fontSize: 13, color: "#64748b", padding: "10px 2px" }}>选择文件后点击“开始审核”。</div>}
 
           {result?.stage === "error" && (
-            <div
-              style={{
-                background: "#fff",
-                border: "1px solid #fecaca",
-                borderRadius: 14,
-                padding: 14,
-                boxShadow: "0 6px 18px rgba(15, 23, 42, 0.06)"
-              }}
-            >
+            <div style={{ background: "#fff", border: "1px solid #fecaca", borderRadius: 14, padding: 14, boxShadow: "0 6px 18px rgba(15, 23, 42, 0.06)" }}>
               <div style={{ fontWeight: 800, color: "#991b1b" }}>{result.title || "失败"}</div>
-              <div style={{ marginTop: 8, whiteSpace: "pre-wrap", color: "#334155", fontSize: 13 }}>
-                {result.message || "（无）"}
-              </div>
-
-              {/* 少量可读信息，避免技术堆字 */}
-              {result?.detail?.http_status ? (
-                <div style={{ marginTop: 8, fontSize: 12, color: "#64748b" }}>
-                  状态码：{result.detail.http_status}
-                </div>
-              ) : null}
+              <div style={{ marginTop: 8, whiteSpace: "pre-wrap", color: "#334155", fontSize: 13 }}>{result.message || "（无）"}</div>
             </div>
           )}
 
           {result?.stage === "done" && (
             <>
-              {/* Summary Card */}
-              <div
-                style={{
-                  background: "#fff",
-                  border: "1px solid #e5e7eb",
-                  borderRadius: 14,
-                  padding: 14,
-                  boxShadow: "0 6px 18px rgba(15, 23, 42, 0.06)"
-                }}
-              >
+              <div style={{ background: "#fff", border: "1px solid #e5e7eb", borderRadius: 14, padding: 14, boxShadow: "0 6px 18px rgba(15, 23, 42, 0.06)" }}>
                 <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
                   <div>
-                    <div style={{ fontSize: 14, fontWeight: 900, color: "#0f172a" }}>
-                      {auditPass ? "审核通过" : "发现问题（需整改）"}
-                    </div>
+                    <div style={{ fontSize: 14, fontWeight: 900, color: "#0f172a" }}>{auditPass ? "审核通过" : "发现问题（需整改）"}</div>
                     <div style={{ marginTop: 4, fontSize: 12, color: "#64748b" }}>
                       风险等级：{riskLevel} · 页数：{result?.meta?.pages || "-"}
-                      {result?.meta?.ocrAdded ? ` · OCR已追加（${result.meta.ocrCount} 张图片）` : ""}
+                      {result?.meta?.ocrAdded ? ` · OCR已追加（${result.meta.ocrCount} 张）` : ""}
                     </div>
                   </div>
-
-                  <div
-                    style={{
-                      padding: "6px 10px",
-                      borderRadius: 999,
-                      fontSize: 12,
-                      fontWeight: 800,
-                      ...toneStyle(auditPass ? "good" : riskLevel === "high" ? "bad" : "warn")
-                    }}
-                  >
+                  <div style={{ padding: "6px 10px", borderRadius: 999, fontSize: 12, fontWeight: 800, ...toneStyle(auditPass ? "good" : riskLevel === "high" ? "bad" : "warn") }}>
                     {auditPass ? "通过" : "需整改"}
                   </div>
                 </div>
@@ -706,145 +573,56 @@ export default function Home() {
                 </div>
 
                 {!result.aiUsed && result.aiRaw && (
-                  <div
-                    style={{
-                      marginTop: 10,
-                      background: "#f8fafc",
-                      border: "1px solid #e5e7eb",
-                      borderRadius: 12,
-                      padding: 10,
-                      fontSize: 12,
-                      color: "#334155"
-                    }}
-                  >
+                  <div style={{ marginTop: 10, background: "#f8fafc", border: "1px solid #e5e7eb", borderRadius: 12, padding: 10, fontSize: 12, color: "#334155" }}>
                     {result.aiRaw.error || result.aiRaw.detail || "AI 未返回可用结果"}
                   </div>
                 )}
               </div>
 
-              {/* AI report */}
               {result.aiUsed && ai?.final_summary && (
-                <div
-                  style={{
-                    marginTop: 12,
-                    background: "#fff",
-                    border: "1px solid #e5e7eb",
-                    borderRadius: 14,
-                    padding: 14,
-                    boxShadow: "0 6px 18px rgba(15, 23, 42, 0.06)"
-                  }}
-                >
+                <div style={{ marginTop: 12, background: "#fff", border: "1px solid #e5e7eb", borderRadius: 14, padding: 14, boxShadow: "0 6px 18px rgba(15, 23, 42, 0.06)" }}>
                   <div style={{ fontSize: 13, fontWeight: 900, color: "#0f172a" }}>融合报告</div>
-
                   <div style={{ marginTop: 10 }}>
                     <div style={{ fontSize: 12, color: "#64748b" }}>总体结论</div>
-                    <div style={{ marginTop: 6, whiteSpace: "pre-wrap", fontSize: 13, color: "#0f172a" }}>
-                      {ai.final_summary.overall || "（无）"}
-                    </div>
-                  </div>
-
-                  <div style={{ display: "flex", gap: 14, flexWrap: "wrap", marginTop: 10 }}>
-                    <div style={{ flex: "1 1 280px" }}>
-                      <div style={{ fontSize: 12, color: "#64748b" }}>关键风险</div>
-                      <ul style={{ margin: "6px 0 0", paddingLeft: 18, fontSize: 13, color: "#0f172a" }}>
-                        {(ai.final_summary.top_risks || []).slice(0, 3).map((x, i) => (
-                          <li key={i}>{x}</li>
-                        ))}
-                        {(!ai.final_summary.top_risks || ai.final_summary.top_risks.length === 0) && <li>（无）</li>}
-                      </ul>
-                    </div>
-                    <div style={{ flex: "1 1 280px" }}>
-                      <div style={{ fontSize: 12, color: "#64748b" }}>下一步建议</div>
-                      <ul style={{ margin: "6px 0 0", paddingLeft: 18, fontSize: 13, color: "#0f172a" }}>
-                        {(ai.final_summary.next_actions || []).slice(0, 3).map((x, i) => (
-                          <li key={i}>{x}</li>
-                        ))}
-                        {(!ai.final_summary.next_actions || ai.final_summary.next_actions.length === 0) && <li>（无）</li>}
-                      </ul>
-                    </div>
+                    <div style={{ marginTop: 6, whiteSpace: "pre-wrap", fontSize: 13, color: "#0f172a" }}>{ai.final_summary.overall || "（无）"}</div>
                   </div>
                 </div>
               )}
 
-              {/* Fix list */}
-              <div
-                style={{
-                  marginTop: 12,
-                  background: "#fff",
-                  border: "1px solid #e5e7eb",
-                  borderRadius: 14,
-                  padding: 14,
-                  boxShadow: "0 6px 18px rgba(15, 23, 42, 0.06)"
-                }}
-              >
-                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
+              <div style={{ marginTop: 12, background: "#fff", border: "1px solid #e5e7eb", borderRadius: 14, padding: 14, boxShadow: "0 6px 18px rgba(15, 23, 42, 0.06)" }}>
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
                   <div style={{ fontSize: 13, fontWeight: 900, color: "#0f172a" }}>整改建议</div>
-                  <div style={{ fontSize: 12, color: "#64748b" }}>
-                    {fixesToShow.length > 0 ? `${fixesToShow.length} 条` : "（无）"}
-                  </div>
+                  <div style={{ fontSize: 12, color: "#64748b" }}>{fixesToShow.length > 0 ? `${fixesToShow.length} 条` : "（无）"}</div>
                 </div>
 
                 {result.aiUsed ? (
                   fixesToShow.length > 0 ? (
                     <div style={{ marginTop: 12, display: "flex", flexDirection: "column", gap: 10 }}>
                       {fixesToShow.map((it, idx) => {
-                        const rw = Array.isArray(it.rewrite) ? it.rewrite : [];
-                        const rw0 = rw[0] || {};
+                        const rw0 = Array.isArray(it.rewrite) && it.rewrite[0] ? it.rewrite[0] : {};
                         return (
-                          <div
-                            key={idx}
-                            style={{
-                              border: "1px solid #e5e7eb",
-                              borderRadius: 12,
-                              padding: 12,
-                              background: "#ffffff"
-                            }}
-                          >
+                          <div key={idx} style={{ border: "1px solid #e5e7eb", borderRadius: 12, padding: 12 }}>
                             <div style={{ fontSize: 12, color: "#64748b" }}>
                               #{idx + 1} · rule_id {it.rule_id} · 第 {it.page ?? "-"} 页
                             </div>
-
                             {Array.isArray(it.quote) && it.quote.length > 0 && (
                               <div style={{ marginTop: 10 }}>
                                 <div style={{ fontSize: 12, color: "#64748b" }}>原文</div>
-                                <div style={{ marginTop: 6, whiteSpace: "pre-wrap", fontSize: 13, color: "#0f172a" }}>
-                                  {it.quote.slice(0, 1).join("\n")}
-                                </div>
+                                <div style={{ marginTop: 6, whiteSpace: "pre-wrap", fontSize: 13, color: "#0f172a" }}>{it.quote.slice(0, 1).join("\n")}</div>
                               </div>
                             )}
-
                             {it.problem ? (
                               <div style={{ marginTop: 10 }}>
                                 <div style={{ fontSize: 12, color: "#64748b" }}>问题</div>
-                                <div style={{ marginTop: 6, whiteSpace: "pre-wrap", fontSize: 13, color: "#0f172a" }}>
-                                  {it.problem}
-                                </div>
+                                <div style={{ marginTop: 6, whiteSpace: "pre-wrap", fontSize: 13, color: "#0f172a" }}>{it.problem}</div>
                               </div>
                             ) : null}
-
-                            <div style={{ marginTop: 10 }}>
-                              <div style={{ fontSize: 12, color: "#64748b" }}>建议</div>
-                              <div
-                                style={{
-                                  marginTop: 8,
-                                  background: "#f8fafc",
-                                  border: "1px solid #e5e7eb",
-                                  borderRadius: 12,
-                                  padding: 10
-                                }}
-                              >
-                                <div style={{ fontSize: 12, color: "#64748b" }}>替换为</div>
-                                <div style={{ marginTop: 6, whiteSpace: "pre-wrap", fontSize: 13, color: "#0f172a", fontWeight: 700 }}>
-                                  {String(rw0.after || "（无）")}
-                                </div>
+                            <div style={{ marginTop: 10, background: "#f8fafc", border: "1px solid #e5e7eb", borderRadius: 12, padding: 10 }}>
+                              <div style={{ fontSize: 12, color: "#64748b" }}>替换为</div>
+                              <div style={{ marginTop: 6, whiteSpace: "pre-wrap", fontSize: 13, color: "#0f172a", fontWeight: 700 }}>
+                                {String(rw0.after || "（无）")}
                               </div>
                             </div>
-
-                            {it.note ? (
-                              <div style={{ marginTop: 10, fontSize: 12, color: "#64748b", whiteSpace: "pre-wrap" }}>
-                                {it.note}
-                              </div>
-                            ) : null}
                           </div>
                         );
                       })}
@@ -853,9 +631,7 @@ export default function Home() {
                     <div style={{ marginTop: 12, fontSize: 13, color: "#64748b" }}>AI 未返回可用整改建议。</div>
                   )
                 ) : (
-                  <div style={{ marginTop: 12, fontSize: 13, color: "#64748b" }}>
-                    AI 未生成整改建议（请检查后端 /api/ai_review）。
-                  </div>
+                  <div style={{ marginTop: 12, fontSize: 13, color: "#64748b" }}>AI 未生成整改建议（请检查后端 /api/ai_review）。</div>
                 )}
               </div>
             </>
@@ -863,8 +639,5 @@ export default function Home() {
         </div>
       </div>
     </div>
-  );
-}
-
   );
 }
