@@ -12,6 +12,10 @@ export default function Home() {
   // 最终结果：pages + audit + aiReport + semantic
   const [result, setResult] = useState(null);
 
+  // ✅ 新增：问题“合规解释/追问”缓存与加载态（不改变原有审核流程）
+  const [explainMap, setExplainMap] = useState({});
+  const [explainLoadingKey, setExplainLoadingKey] = useState("");
+
   // ---------- util ----------
   async function safeJson(resp) {
     const raw = await resp.text();
@@ -163,6 +167,46 @@ export default function Home() {
     return null;
   }
 
+  // ✅ 新增：为“合规解释/追问”生成 key（不影响原有 mustFix 去重逻辑）
+  function explainKeyOf(it, idx) {
+    const q0 = Array.isArray(it?.quote) && it.quote[0] ? String(it.quote[0]) : "";
+    return `${it?.rule_id || ""}__${it?.page ?? ""}__${idx}__${q0.slice(0, 60)}`;
+  }
+
+  // ✅ 新增：调用后端 /api/ai_explain（你需要已创建 pages/api/ai_explain.js）
+  async function onExplain(it, idx) {
+    const k = explainKeyOf(it, idx);
+    if (explainMap[k]) return; // 已缓存
+    setExplainLoadingKey(k);
+
+    try {
+      const payload = {
+        item: {
+          rule_id: it?.rule_id || "",
+          page: it?.page ?? null,
+          quote: Array.isArray(it?.quote) ? it.quote.slice(0, 3) : [],
+          problem: it?.problem || "",
+          rewrite: Array.isArray(it?.rewrite) ? it.rewrite.slice(0, 3) : [],
+          note: it?.note || "",
+          kind: it?.kind || "",
+        },
+      };
+
+      const r = await fetch("/api/ai_explain", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+
+      const j = await safeJson(r);
+      setExplainMap((m) => ({ ...m, [k]: j }));
+    } catch (e) {
+      setExplainMap((m) => ({ ...m, [k]: { ok: false, error: String(e?.message || e) } }));
+    } finally {
+      setExplainLoadingKey("");
+    }
+  }
+
   // ---------- PPTX: browser extract ----------
   async function extractFromPptxBrowser(pptxFile, doOCR) {
     const okZip = await ensureJSZip();
@@ -201,7 +245,7 @@ export default function Home() {
         if (/^ppt\/media\/.+\.(png|jpg|jpeg)$/i.test(relativePath)) mediaFiles.push(relativePath);
       });
 
-      // 按文件大小排序，优先识别“大图”（更可能是截图/正文图）
+      // 按文件大小排序，优先识别“大图”
       const mediaWithSize = [];
       for (const f of mediaFiles) {
         const fileObj = zip.file(f);
@@ -211,7 +255,7 @@ export default function Home() {
       }
       mediaWithSize.sort((a, b) => b.size - a.size);
 
-      // 分批：每批 30 张，全部跑（你说放开）
+      // 分批：每批 30 张
       const batchSize = 30;
       const total = mediaWithSize.length;
 
@@ -230,7 +274,9 @@ export default function Home() {
           }));
 
           try {
-            const blob = new Blob([item.ab], { type: "image/" + (item.path.toLowerCase().endsWith(".png") ? "png" : "jpeg") });
+            const blob = new Blob([item.ab], {
+              type: "image/" + (item.path.toLowerCase().endsWith(".png") ? "png" : "jpeg"),
+            });
             const url = URL.createObjectURL(blob);
 
             // eslint-disable-next-line no-undef
@@ -266,6 +312,8 @@ export default function Home() {
 
     setLoading(true);
     setResult(null);
+    setExplainMap({}); // ✅ 不改变原逻辑，只是清空解释缓存
+    setExplainLoadingKey("");
     setOcrStatus((s) => ({ ...s, progress: 0 }));
 
     try {
@@ -459,11 +507,7 @@ export default function Home() {
 
           <div style={styles.row}>
             <label style={styles.switchRow}>
-              <input
-                type="checkbox"
-                checked={enableOCR}
-                onChange={(e) => setEnableOCR(e.target.checked)}
-              />
+              <input type="checkbox" checked={enableOCR} onChange={(e) => setEnableOCR(e.target.checked)} />
               <span style={{ marginLeft: 8 }}>启用图片 OCR </span>
             </label>
 
@@ -505,7 +549,8 @@ export default function Home() {
               <span style={styles.badge}>{auditPass ? "规则：通过" : "规则：不通过"}</span>
               <span style={{ ...styles.badge, opacity: 0.8 }}>风险：{riskLevel}</span>
               <span style={{ ...styles.badge, opacity: 0.8 }}>
-                页数：{result.pagesCount || 0}{result.hasOCRText ? "（含OCR）" : ""}
+                页数：{result.pagesCount || 0}
+                {result.hasOCRText ? "（含OCR）" : ""}
               </span>
             </div>
 
@@ -539,44 +584,125 @@ export default function Home() {
               <div style={styles.empty}>（无）</div>
             ) : (
               <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-                {mustFixList.map((it, idx) => (
-                  <div key={idx} style={styles.itemCard}>
-                    <div style={styles.itemTitle}>
-                      #{idx + 1} · {it.rule_id} · 第{it.page ?? "?"}页
-                      <span style={styles.tag}>{it.kind === "semantic" ? "语义扫描" : "规则+复核"}</span>
-                    </div>
+                {mustFixList.map((it, idx) => {
+                  const k = explainKeyOf(it, idx);
+                  const exp = explainMap[k];
+                  const expOk = exp && exp.ok === true;
+                  const expErr = exp && exp.ok === false;
+                  const btnBusy = explainLoadingKey === k;
 
-                    {Array.isArray(it.quote) && it.quote.length > 0 ? (
-                      <div style={{ marginTop: 8 }}>
-                        <div style={styles.label}>定位原文</div>
-                        <div style={styles.pre}>{it.quote.slice(0, 2).join("\n")}</div>
-                      </div>
-                    ) : null}
+                  return (
+                    <details key={idx} style={styles.itemCard}>
+                      <summary style={styles.summaryRow}>
+                        <div style={styles.itemTitle}>
+                          #{idx + 1} · {it.rule_id} · 第{it.page ?? "?"}页
+                          <span style={styles.tag}>{it.kind === "semantic" ? "语义扫描" : "规则+复核"}</span>
+                        </div>
+                      </summary>
 
-                    {it.problem ? (
-                      <div style={{ marginTop: 8 }}>
-                        <div style={styles.label}>问题</div>
-                        <div style={styles.pre}>{it.problem}</div>
-                      </div>
-                    ) : null}
+                      {Array.isArray(it.quote) && it.quote.length > 0 ? (
+                        <div style={{ marginTop: 8 }}>
+                          <div style={styles.label}>定位原文</div>
+                          <div style={styles.pre}>{it.quote.slice(0, 2).join("\n")}</div>
+                        </div>
+                      ) : null}
 
-                    {Array.isArray(it.rewrite) && it.rewrite.length > 0 ? (
-                      <div style={{ marginTop: 8 }}>
-                        <div style={styles.label}>建议改写</div>
-                        <div style={styles.rewriteBox}>
-                          <div style={styles.rewriteCol}>
-                            <div style={styles.rewriteLabel}>before</div>
-                            <div style={styles.pre}>{it.rewrite[0]?.before || ""}</div>
-                          </div>
-                          <div style={styles.rewriteCol}>
-                            <div style={styles.rewriteLabel}>after</div>
-                            <div style={{ ...styles.pre, fontWeight: 700 }}>{it.rewrite[0]?.after || ""}</div>
+                      {it.problem ? (
+                        <div style={{ marginTop: 8 }}>
+                          <div style={styles.label}>问题</div>
+                          <div style={styles.pre}>{it.problem}</div>
+                        </div>
+                      ) : null}
+
+                      {Array.isArray(it.rewrite) && it.rewrite.length > 0 ? (
+                        <div style={{ marginTop: 8 }}>
+                          <div style={styles.label}>建议改写</div>
+                          <div style={styles.rewriteBox}>
+                            <div style={styles.rewriteCol}>
+                              <div style={styles.rewriteLabel}>before</div>
+                              <div style={styles.pre}>{it.rewrite[0]?.before || ""}</div>
+                            </div>
+                            <div style={styles.rewriteCol}>
+                              <div style={styles.rewriteLabel}>after</div>
+                              <div style={{ ...styles.pre, fontWeight: 700 }}>{it.rewrite[0]?.after || ""}</div>
+                            </div>
                           </div>
                         </div>
+                      ) : null}
+
+                      {/* ✅ 新增：合规解释/追问（不改变原有 mustFix 展示逻辑） */}
+                      <div style={styles.explainRow}>
+                        <button
+                          onClick={(e) => {
+                            e.preventDefault(); // 防止 details 被点击时反复折叠
+                            onExplain(it, idx);
+                          }}
+                          disabled={btnBusy}
+                          style={{ ...styles.ghostBtn, opacity: btnBusy ? 0.6 : 1 }}
+                        >
+                          {expOk ? "已生成解释" : btnBusy ? "生成中..." : "合规解释 / 追问"}
+                        </button>
+
+                        {expErr ? <span style={styles.explainErr}>解释失败：{exp.error || exp.detail || "未知错误"}</span> : null}
                       </div>
-                    ) : null}
-                  </div>
-                ))}
+
+                      {expOk ? (
+                        <div style={styles.explainBox}>
+                          <div style={styles.explainTitle}>{exp.title || "合规解释"}</div>
+
+                          <div style={{ marginTop: 10 }}>
+                            <div style={styles.label}>为何有风险</div>
+                            <ul style={styles.ul}>
+                              {(exp.why_risky || []).slice(0, 6).map((x, i) => (
+                                <li key={i}>{x}</li>
+                              ))}
+                              {(!exp.why_risky || exp.why_risky.length === 0) && <li>（无）</li>}
+                            </ul>
+                          </div>
+
+                          <div style={{ marginTop: 10 }}>
+                            <div style={styles.label}>触发点（基于原文）</div>
+                            <ul style={styles.ul}>
+                              {(exp.what_triggered || []).slice(0, 6).map((x, i) => (
+                                <li key={i}>{x}</li>
+                              ))}
+                              {(!exp.what_triggered || exp.what_triggered.length === 0) && <li>（无）</li>}
+                            </ul>
+                          </div>
+
+                          <div style={{ marginTop: 10 }}>
+                            <div style={styles.label}>怎么改（执行要点）</div>
+                            <ul style={styles.ul}>
+                              {(exp.how_to_fix || []).slice(0, 6).map((x, i) => (
+                                <li key={i}>{x}</li>
+                              ))}
+                              {(!exp.how_to_fix || exp.how_to_fix.length === 0) && <li>（无）</li>}
+                            </ul>
+                          </div>
+
+                          <div style={{ marginTop: 10 }}>
+                            <div style={styles.label}>更合规的替代表述</div>
+                            <ul style={styles.ul}>
+                              {(exp.better_wording || []).slice(0, 6).map((x, i) => (
+                                <li key={i} style={{ whiteSpace: "pre-wrap" }}>
+                                  {x}
+                                </li>
+                              ))}
+                              {(!exp.better_wording || exp.better_wording.length === 0) && <li>（无）</li>}
+                            </ul>
+                          </div>
+
+                          {exp.notes ? (
+                            <div style={{ marginTop: 10 }}>
+                              <div style={styles.label}>备注</div>
+                              <div style={styles.pre}>{exp.notes}</div>
+                            </div>
+                          ) : null}
+                        </div>
+                      ) : null}
+                    </details>
+                  );
+                })}
               </div>
             )}
           </>
@@ -643,11 +769,35 @@ const styles = {
   sectionTitle: { fontWeight: 900, margin: "12px 0 10px", fontSize: 14 },
 
   itemCard: { border: "1px solid #eee", borderRadius: 14, padding: 12, background: "#fff" },
+  summaryRow: { cursor: "pointer", listStyle: "none" },
   itemTitle: { fontWeight: 900, fontSize: 13, display: "flex", gap: 8, alignItems: "center" },
-  tag: { marginLeft: "auto", fontSize: 12, color: "#666", border: "1px solid #eee", padding: "4px 8px", borderRadius: 999, background: "#fafafa" },
+  tag: {
+    marginLeft: "auto",
+    fontSize: 12,
+    color: "#666",
+    border: "1px solid #eee",
+    padding: "4px 8px",
+    borderRadius: 999,
+    background: "#fafafa",
+  },
   label: { fontSize: 12, color: "#666", marginBottom: 6 },
 
   rewriteBox: { display: "flex", gap: 10, flexWrap: "wrap" },
   rewriteCol: { flex: "1 1 360px", border: "1px solid #eee", borderRadius: 12, padding: 10, background: "#fafafa" },
   rewriteLabel: { fontSize: 12, color: "#666", marginBottom: 6 },
+
+  // ✅ explain UI（新增，不影响你现有视觉）
+  explainRow: { display: "flex", gap: 10, alignItems: "center", marginTop: 10, flexWrap: "wrap" },
+  ghostBtn: {
+    padding: "8px 10px",
+    borderRadius: 12,
+    border: "1px solid #ddd",
+    background: "#fff",
+    cursor: "pointer",
+    fontSize: 13,
+  },
+  explainErr: { fontSize: 12, color: "#b42318" },
+  explainBox: { marginTop: 12, paddingTop: 12, borderTop: "1px dashed #e6e6e6" },
+  explainTitle: { fontWeight: 900, fontSize: 13 },
+  ul: { margin: "6px 0 0", paddingLeft: 18, fontSize: 13, lineHeight: 1.55 },
 };
