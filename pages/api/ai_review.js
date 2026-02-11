@@ -1,4 +1,8 @@
 // pages/api/ai_review.js
+
+import fs from "fs";
+import path from "path";
+
 export default async function handler(req, res) {
   try {
     if (req.method !== "POST") return res.status(405).json({ ok: false, error: "Method not allowed" });
@@ -8,6 +12,14 @@ export default async function handler(req, res) {
 
     const body = req.body || {};
     const mode = body.mode === "semantic" ? "semantic" : body.mode === "report" ? "report" : "legacy";
+
+    // internal_training / offline_marketing / internet_publish
+    const scene =
+      body.scene === "offline_marketing"
+        ? "offline_marketing"
+        : body.scene === "internet_publish"
+        ? "internet_publish"
+        : "internal_training";
 
     // legacy
     const text = typeof body.text === "string" ? body.text : null;
@@ -57,8 +69,14 @@ export default async function handler(req, res) {
 }
 `.trim();
 
+    // ✅ semantic：加入 legal_refs（按场景筛选 + TopN命中），但仍保持你原 semantic 输出结构
     const system_semantic = `
 你是保险课件/宣传材料合规“全篇语义扫描”助手。任务：在不推翻规则审核(audit)结论的前提下，仅找出【必须修改】且【高风险(high)】的语义问题。
+
+你会得到：
+- 全篇抽样文本（高概率风险页+尾部抽样）
+- 场景 scene（internal_training=内部培训课件 / offline_marketing=对外线下宣传 / internet_publish=互联网发布）
+- 法律/制度参考片段 legal_refs（已按场景与关键词命中筛选，数量有限）
 
 硬性要求：
 1) 只输出必须修改的问题：必须同时满足 must_fix=true 且 severity="high"。
@@ -75,7 +93,7 @@ export default async function handler(req, res) {
       "page": 1,
       "quote": ["原文片段<=80字"],
       "problem": "问题是什么",
-      "why_high": "为什么属于必须修改的高风险",
+      "why_high": "为什么属于必须修改的高风险（可引用 legal_refs 的 id 作为依据）",
       "fix": "给一条可直接替换进课件的改写句子"
     }
   ]
@@ -116,22 +134,33 @@ export default async function handler(req, res) {
       .slice(0, 6000);
 
     // semantic：全篇扫描也要控长度，抽“高概率风险页”
-    // 规则：取前 6 页 + 含关键字页 + 最后 2 页（总计再截断）
-    const KEYWORDS = ["保本", "收益", "利息", "稳赚", "替代存款", "第一", "最好", "唯一", "限时", "错过", "马上", "确保", "零风险", "100%"];
+    const KEYWORDS = [
+      "保本",
+      "收益",
+      "利息",
+      "稳赚",
+      "替代存款",
+      "第一",
+      "最好",
+      "唯一",
+      "限时",
+      "错过",
+      "马上",
+      "确保",
+      "零风险",
+      "100%",
+    ];
     function collectSemanticPages(all) {
       const blocks = [];
-      // 前 6 页
       for (let p = 1; p <= 6; p++) {
         const b = pickPageBlock(all, p, 900);
         if (b) blocks.push(b);
       }
-      // 关键字命中页（简单扫 1~60 页）
       for (let p = 1; p <= 60; p++) {
         const b = pickPageBlock(all, p, 900);
         if (!b) continue;
         if (KEYWORDS.some((k) => b.includes(k))) blocks.push(b);
       }
-      // 最后 2 页（粗略：从末尾找两个 marker）
       const tail = String(all || "").slice(-8000);
       blocks.push("【尾部抽样】\n" + tail);
 
@@ -141,8 +170,78 @@ export default async function handler(req, res) {
 
     const rulesSlim = (rulesJson || "").slice(0, 800);
 
+    // ✅ 新增：读取法律库 + 场景过滤 + TopN命中（只喂给 semantic）
+    function readLegalKB() {
+      const p = path.join(process.cwd(), "legal", "legal_kb.json");
+      const raw = fs.readFileSync(p, "utf-8");
+      return JSON.parse(raw);
+    }
+
+    function filterKBByScene(items, sc) {
+      const sceneNow = sc || "internal_training";
+      return (items || []).filter((it) => {
+        const scope = Array.isArray(it?.scope) ? it.scope : [];
+        const excl = Array.isArray(it?.exclude_scope) ? it.exclude_scope : [];
+        if (excl.includes(sceneNow)) return false;
+        if (scope.length === 0) return true;
+        return scope.includes(sceneNow);
+      });
+    }
+
+    function scoreKBItem(textLower, it) {
+      let s = 0;
+      const kws = Array.isArray(it?.keywords) ? it.keywords : [];
+      for (const k of kws) {
+        if (!k) continue;
+        const kk = String(k).toLowerCase();
+        if (kk && textLower.includes(kk)) s += 3;
+      }
+      const title = String(it?.title || "").toLowerCase();
+      if (title && textLower.includes(title)) s += 2;
+      // 规则正文命中弱加权
+      if (kws.slice(0, 3).some((k) => textLower.includes(String(k).toLowerCase()))) s += 1;
+      return s;
+    }
+
+    function pickTopKB(items, sc, text, topN = 12) {
+      const filtered = filterKBByScene(items, sc);
+      const lower = String(text || "").toLowerCase();
+
+      const scored = filtered
+        .map((it) => ({ it, score: scoreKBItem(lower, it) }))
+        .filter((x) => x.score > 0);
+
+      if (scored.length === 0) {
+        // 没命中时给“通用底座”（不至于 AI 没依据）
+        const fallbackIds = new Set(["R-01", "R-02", "R-03", "R-04", "R-11"]);
+        return filtered.filter((x) => fallbackIds.has(x.id)).slice(0, topN);
+      }
+
+      scored.sort((a, b) => b.score - a.score);
+      return scored.slice(0, topN).map((x) => x.it);
+    }
+
+    let legalRefs = [];
+    if (mode === "semantic") {
+      try {
+        const kb = readLegalKB();
+        const items = Array.isArray(kb?.items) ? kb.items : [];
+        const top = pickTopKB(items, scene, semanticBlocks, 12);
+        legalRefs = top.map((x) => ({
+          id: x.id,
+          title: x.title,
+          source: x.source,
+          basis: x.basis,
+          rule: x.rule,
+        }));
+      } catch {
+        legalRefs = [];
+      }
+    }
+
     let system = mode === "report" ? system_report : mode === "semantic" ? system_semantic : system_legacy;
 
+    // ✅ semantic 的 user prompt：新增 scene + legal_refs（其余保持你原来结构）
     let user =
       mode === "report"
         ? `
@@ -157,6 +256,12 @@ ${rulesSlim}
 `.trim()
         : mode === "semantic"
         ? `
+【场景 scene】
+${scene}
+
+【法律/制度参考片段 legal_refs（已筛选TopN，数量有限）】
+${JSON.stringify(legalRefs, null, 2)}
+
 【全篇抽样（高概率风险页 + 尾部抽样）】
 ${semanticBlocks}
 
@@ -283,7 +388,6 @@ ${JSON.stringify(review, null, 2)}
           merged.push(it);
         } else {
           const prev = mp.get(key);
-          // rewrite 取 “after 更长更具体”的那条
           const prevAfter = prev?.rewrite?.[0]?.after ? String(prev.rewrite[0].after) : "";
           const nowAfter = it?.rewrite?.[0]?.after ? String(it.rewrite[0].after) : "";
           if (nowAfter.length > prevAfter.length) {
@@ -301,9 +405,15 @@ ${JSON.stringify(review, null, 2)}
 
     if (mode === "semantic") {
       const arr = Array.isArray(parsed.semantic_extra) ? parsed.semantic_extra : [];
-      // 再次强制过滤：只保留 high + must_fix
       const filtered = arr.filter((x) => x?.severity === "high" && x?.must_fix === true);
-      return res.status(200).json({ ok: true, semantic_extra: filtered });
+
+      // ✅ 不改变返回结构，只额外附带 used_legal_refs（前端不接也不影响）
+      return res.status(200).json({
+        ok: true,
+        semantic_extra: filtered,
+        used_legal_refs: legalRefs.map((x) => x.id),
+        scene,
+      });
     }
 
     // legacy
