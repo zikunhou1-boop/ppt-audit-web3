@@ -399,16 +399,17 @@ export default function Home() {
       const aiUsed = isAiReportEffective(aiReportRaw);
 
       // 4) AI semantic（全篇语义扫描：只要 high 必改）
-      const r4 = await fetch("/api/ai_review", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          mode: "semantic",
-          pagesText: fullText,
-          audit,
-          rulesJson,
-        }),
-      });
+     const r4 = await fetch("/api/ai_review", {
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify({
+    mode: "semantic",
+    scene: "internal_training",
+    pagesText: fullText,
+    audit,
+    rulesJson,
+  }),
+});
       const semanticRaw = await safeJson(r4);
 
       const semanticHighMust = Array.isArray(semanticRaw?.semantic_extra)
